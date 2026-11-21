@@ -126,6 +126,11 @@ Behavior common to all tools:
 | `read_messages` | Pull recent ECU messages (Lua `print` included). |
 | `wait_for_message` | Block until a message matches a regex. |
 | `read_tune` | Save the complete ECU tune as a `.msq` file. |
+| `list_maps` | Discover numeric calibration maps in the connected ECU's INI. |
+| `read_map` | Read a map and its axis bins from ECU RAM. |
+| `preview_map_write` | Review current, requested, and quantized patch values with a map revision. |
+| `write_map` | Update map cells in ECU RAM and verify readback, with optional page burn. |
+| `rollback_map_write` | Preview or selectively undo a verified live map write. |
 | `write_tune` | Merge, burn, and verify a host-side `.msq` tune on the ECU. |
 | `download_bundle` | Download a fresh board or universal autoupdate bundle, optionally combining the universal console with board firmware. |
 | `update_firmware` | Update via OpenBLT, back up and migrate the configuration, then reconnect. |
@@ -444,6 +449,62 @@ Returns `success: true` with `match` (same shape as a `read_messages` entry), or
 `success: false` with `error: "timeout"` and `latestSeq`. Already-buffered messages are
 checked first, so without `sinceSeq` a stale message from minutes ago can satisfy the
 wait — pass `sinceSeq` captured before triggering the action you're waiting on.
+
+### Map editing
+
+Call `list_maps` to find table IDs, dimensions, and value metadata. Then call
+`read_map` with an `id` to read the current cells and available axis bins from ECU
+RAM. The matrix follows INI storage order, with rows indexed by Y and columns
+indexed by X. Values and bins use the console's parsed INI scale. For example,
+the target lambda table uses lambda even if TunerStudio displays AFR. The
+`units` field may contain an INI expression.
+
+Pass the zero-based starting `row` and `column` and a rectangular `values`
+matrix to `write_map`. For example, this updates two adjacent VE cells:
+
+```json
+{"name":"write_map","arguments":{"id":"veTableTbl","row":2,"column":3,"values":[[73.5,74.0]]}}
+```
+
+For a guarded edit, send the same `id`, `row`, `column`, and `values` to
+`preview_map_write` first. It returns `currentValues`, `requestedValues`, and
+`effectiveValues` for the patch. To apply the reviewed patch, send those same
+arguments to `write_map` with the returned `revision` as `expectedRevision`.
+`read_map` also returns a revision. The revision represents the firmware
+signature, table ID, cell bytes, and available axis bytes. If any of those
+change, the guarded write returns an error before sending edits or a burn.
+Read or preview again after a conflict. Writes without `expectedRevision`
+still work. The revision check and write are serialized on this Console
+connection. An independent client can change ECU RAM between wire commands.
+
+The tool checks the entire patch against the map dimensions, literal INI bounds,
+and storage range before writing. The result includes the effective values
+after storage rounding, and `verified` indicates that the map matched on ECU
+readback. If communication fails during a write, some cells may already be
+updated. Read the map again to establish its current state.
+
+Edits apply in RAM by default. Set `persist` to `true` to request a flash burn of
+the entire page, including any other pending changes on that page. You can
+repeat an already-applied patch with `persist: true` to request the burn later.
+`burnAcknowledged` reports the ECU's burn acknowledgement. Readback verifies RAM.
+
+### Roll back a map write
+
+A verified `write_map` that changes cell bytes returns a `writeId`. Call
+`rollback_map_write` with that ID to preview eligible cells and conflicts.
+Send `apply: true` to restore eligible cells and verify each by readback.
+
+Each cell is checked again at apply time. A cell that still has the value
+written by MCP is eligible. A cell with a different value appears in
+`conflicts` and is preserved. A cell already at its original value appears
+in `alreadyRestored`. Changed axis bins block the rollback. A successful
+apply consumes the ID, including when some cells conflict. The server keeps
+the last 32 eligible write IDs on the current ECU connection.
+
+Rollback defaults to RAM. With `apply: true`, `persist: true` requests a
+whole-page burn after a restoration, including any pending manual edits on
+that page. The ECU protocol uses separate read and write commands, so an
+independent client can still edit a cell between those commands.
 
 ### `read_tune`
 

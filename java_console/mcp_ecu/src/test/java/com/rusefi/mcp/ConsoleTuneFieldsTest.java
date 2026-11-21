@@ -2,6 +2,7 @@ package com.rusefi.mcp;
 
 import com.opensr5.ini.IniFileMetaInfo;
 import com.opensr5.ini.IniFileModel;
+import com.opensr5.ini.TableModel;
 import com.opensr5.ini.field.*;
 import com.rusefi.binaryprotocol.BinaryProtocol;
 import com.rusefi.config.FieldType;
@@ -71,6 +72,121 @@ class ConsoleTuneFieldsTest {
         verify(link, never()).close();
         verify(protocol, never()).close();
         verify(protocol, never()).getControllerConfiguration();
+    }
+
+    @Test void writesOnlyValidatedMapPatchToTheDeclaredPage() throws Exception {
+        ArrayIniField cells = new ArrayIniField("cells", 8, FieldType.UINT16, 3, 2, "%", .5, "0", "100", "1");
+        cells.setPageIndex(0x300);
+        TableModel table = mock(TableModel.class);
+        when(table.getTableId()).thenReturn("fuel");
+        when(table.getZBinsConstant()).thenReturn("cells");
+        when(ini.getTables()).thenReturn(Collections.singletonMap("fuel", table));
+        when(ini.getTable("fuel")).thenReturn(table);
+        when(ini.findIniField("cells")).thenReturn(Optional.of(cells));
+        ArrayIniField axis = new ArrayIniField("rpm", 32, FieldType.UINT16, 1, 3, "rpm", 1, null, null, "0");
+        when(table.getXBinsConstant()).thenReturn("rpm");
+        when(ini.findIniField("rpm")).thenReturn(Optional.of(axis));
+        when(protocol.getIniFileNullable()).thenReturn(ini);
+
+        ByteBuffer.wrap(extra).order(ByteOrder.LITTLE_ENDIAN).putShort(8, (short) 20);
+        doAnswer(call -> {
+            assertEquals("test-tune-link", Thread.currentThread().getName());
+            assertEquals(0x300, (int) call.getArgument(4));
+            System.arraycopy(call.getArgument(0), call.getArgument(1), extra, call.getArgument(2), call.getArgument(3));
+            return null;
+        }).when(protocol).writeInBlocks(any(byte[].class), anyInt(), anyInt(), anyInt(), anyInt());
+        when(protocol.burnPage(0x300)).thenReturn(true);
+
+        EcuMcpServer mcp = new EcuMcpServer(link, protocol);
+        try {
+            JSONObject list = mapTool(mcp, "list_maps", new JSONObject());
+            assertEquals("fuel", ((JSONObject) ((JSONArray) list.get("maps")).get(0)).get("id"));
+            JSONObject args = new JSONObject();
+            args.put("id", "fuel");
+            JSONObject before = mapTool(mcp, "read_map", args);
+            assertEquals(array(array(10.0, 0.0, 0.0), array(0.0, 0.0, 0.0)), before.get("values"));
+
+            args.put("row", 0L);
+            args.put("column", 1L);
+            args.put("values", array(array(3.2), array(101.0)));
+            assertEquals(false, mapTool(mcp, "write_map", args).get("success"));
+            verify(protocol, never()).writeInBlocks(any(byte[].class), anyInt(), anyInt(), anyInt(), anyInt());
+
+            args.put("values", array(array(3.2), array(4.5)));
+            JSONObject preview = mapTool(mcp, "preview_map_write", args);
+            assertEquals(true, preview.get("success"), preview.toJSONString());
+            assertEquals(before.get("revision"), preview.get("revision"));
+            assertEquals(array(array(0.0), array(0.0)), preview.get("currentValues"));
+            assertEquals(array(array(3.2), array(4.5)), preview.get("requestedValues"));
+            assertEquals(array(array(3.0), array(4.5)), preview.get("effectiveValues"));
+            verify(protocol, never()).writeInBlocks(any(byte[].class), anyInt(), anyInt(), anyInt(), anyInt());
+            verify(protocol, never()).burnPage(anyInt());
+
+            args.put("expectedRevision", preview.get("revision"));
+            args.put("persist", true);
+            main[32] = 1;
+            JSONObject conflict = mapTool(mcp, "write_map", args);
+            assertEquals(false, conflict.get("success"));
+            assertNotEquals(preview.get("revision"), conflict.get("revision"));
+            assertTrue(conflict.get("error").toString().contains("revision changed"));
+            verify(protocol, never()).writeInBlocks(any(byte[].class), anyInt(), anyInt(), anyInt(), anyInt());
+            verify(protocol, never()).burnPage(anyInt());
+
+            args.remove("persist");
+            args.put("expectedRevision", mapTool(mcp, "preview_map_write", args).get("revision"));
+            JSONObject update = mapTool(mcp, "write_map", args);
+            assertEquals(true, update.get("verified"), update.toJSONString());
+            assertEquals(array(array(10.0, 3.0, 0.0), array(0.0, 4.5, 0.0)), update.get("values"));
+            verify(protocol).writeInBlocks(any(byte[].class), eq(2), eq(10), eq(2), eq(0x300));
+            verify(protocol).writeInBlocks(any(byte[].class), eq(8), eq(16), eq(2), eq(0x300));
+            verify(protocol, never()).burnPage(anyInt());
+
+            args.put("persist", true);
+            assertEquals(false, mapTool(mcp, "write_map", args).get("success"));
+            verify(protocol, never()).burnPage(anyInt());
+            args.remove("expectedRevision");
+            JSONObject persisted = mapTool(mcp, "write_map", args);
+            assertEquals(false, persisted.get("changed"), persisted.toJSONString());
+            assertEquals(true, persisted.get("burnAcknowledged"));
+            verify(protocol).burnPage(0x300);
+            verify(protocol, times(2)).writeInBlocks(any(byte[].class), anyInt(), anyInt(), anyInt(), anyInt());
+            JSONObject rollbackArgs = new JSONObject();
+            rollbackArgs.put("writeId", update.get("writeId"));
+            JSONObject undoPreview = mapTool(mcp, "rollback_map_write", rollbackArgs);
+            assertEquals(2, ((JSONArray) undoPreview.get("eligibleCells")).size(), undoPreview.toJSONString());
+            assertEquals(false, undoPreview.get("applied"));
+
+            // A manual edit during review changes one patched cell and another outside the patch.
+            ByteBuffer live = ByteBuffer.wrap(extra).order(ByteOrder.LITTLE_ENDIAN);
+            live.putShort(10, (short) 18).putShort(12, (short) 24);
+            rollbackArgs.put("apply", true);
+            main[32] = 2;
+            assertEquals(false, mapTool(mcp, "rollback_map_write", rollbackArgs).get("success"));
+            verify(protocol, times(2)).writeInBlocks(any(byte[].class), anyInt(), anyInt(), anyInt(), anyInt());
+
+            main[32] = 1;
+            JSONObject rollback = mapTool(mcp, "rollback_map_write", rollbackArgs);
+            assertEquals(true, rollback.get("success"), rollback.toJSONString());
+            assertEquals(false, rollback.get("complete"));
+            assertEquals(1, ((JSONArray) rollback.get("restoredCells")).size());
+            assertEquals(1, ((JSONArray) rollback.get("conflicts")).size());
+            assertEquals(18, live.getShort(10));
+            assertEquals(24, live.getShort(12));
+            assertEquals(0, live.getShort(16));
+            verify(protocol, times(3)).writeInBlocks(any(byte[].class), anyInt(), anyInt(), anyInt(), anyInt());
+            verify(protocol, times(1)).burnPage(anyInt());
+            assertEquals(false, mapTool(mcp, "rollback_map_write", rollbackArgs).get("success"));
+
+        } finally {
+            mcp.shutdown();
+        }
+    }
+
+    private static JSONObject mapTool(EcuMcpServer mcp, String name, JSONObject args) throws Exception {
+        JSONObject params = new JSONObject();
+        params.put("name", name);
+        params.put("arguments", args);
+        return (JSONObject) mcp.toolsCall(params).get("structuredContent");
     }
 
     @Test void readsOnlyRequestedRangesAndDecodesScaledScalarsEnumsAndSecondaryArrays() throws Exception {

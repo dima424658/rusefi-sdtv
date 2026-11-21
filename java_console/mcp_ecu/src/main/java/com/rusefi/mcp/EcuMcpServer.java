@@ -96,6 +96,7 @@ public class EcuMcpServer {
     private MessagesCentral.MessageListener messagesListener;
     private volatile boolean closed;
     private final Object connectLock = new Object();
+    private final EcuMaps maps = new EcuMaps();
     private final EcuDataLogger dataLogger = new EcuDataLogger();
     /**
      * Console output-channel polling is subscription based (#10171): the pull thread fetches only the byte ranges
@@ -435,6 +436,26 @@ public class EcuMcpServer {
                         {"timeoutMs", "integer", "Wait timeout in ms. Default 10000."},
                         {"sinceSeq", "integer", "Only consider messages with seq strictly greater than this."}
                 }, new String[]{"regex"}, false)));
+        tools.add(tool("list_maps", "List ECU calibration maps from the connected firmware INI.",
+                emptyObjectSchema()));
+        tools.add(tool("read_map", "Read current map cells and axis bins from ECU RAM in parsed INI units.",
+                schemaObject(new String[][]{
+                        {"id", "string", "Table ID from list_maps."}
+                }, new String[]{"id"}, false)));
+        tools.add(tool("preview_map_write", "Preview current, requested and quantized values for a map patch. " +
+                "Returns a revision for guarded write_map. This tool only reads ECU RAM.", mapPatchSchema(false)));
+        tools.add(tool("write_map", "Patch a rectangle of map cells in ECU RAM and verify readback. " +
+                "Pass expectedRevision from preview_map_write to reject a stale patch. " +
+                "Returns effective values after ECU storage quantization. Axes remain unchanged.",
+                mapPatchSchema(true)));
+        tools.add(tool("rollback_map_write",
+                "Preview or selectively restore cells from a verified write_map in the current connection. " +
+                        "Preserves cells edited since the write and reports their conflicts. Changed axes block rollback.",
+                schemaObject(new String[][]{
+                        {"writeId", "string", "ID returned by a changed write_map call."},
+                        {"apply", "boolean", "Apply the rollback. Omit or use false to preview."},
+                        {"persist", "boolean", "Request a whole-page flash burn after restoring cells. Default false."}
+                }, new String[]{"writeId"}, false)));
         tools.add(tool("read_tune",
                 "Read the complete tune (all calibration constants) from the ECU and save it as a " +
                         "TunerStudio-compatible .msq file on the MCP server host. The tune is built from " +
@@ -532,6 +553,11 @@ public class EcuMcpServer {
                 case "data_logging_status": toolResult = dataLogger.status(); break;
                 case "read_messages": toolResult = doReadMessages(args); break;
                 case "wait_for_message": toolResult = doWaitForMessage(args); break;
+                case "list_maps":   toolResult = doMaps(args, name); break;
+                case "read_map":    toolResult = doMaps(args, name); break;
+                case "preview_map_write": toolResult = doMaps(args, name); break;
+                case "write_map":   toolResult = doMaps(args, name); break;
+                case "rollback_map_write": toolResult = doMaps(args, name); break;
                 case "read_tune":   toolResult = doReadTune(args); break;
                 case "write_tune":  toolResult = doWriteTune(args); break;
                 case "import_ini_to_cache": toolResult = com.rusefi.mcp.tools.IniTools.importIniToCache(args); break;
@@ -759,6 +785,35 @@ public class EcuMcpServer {
             return errorBody("'timeoutMs' must be between 1 and 120000");
         }
         return SdCardMount.mount(ensureConnected(null), SensorCentral.getInstance(), toEcu, timeoutMs);
+    }
+
+    private JSONObject doMaps(JSONObject args, String operation) throws Exception {
+        LinkManager lm = ensureConnected(null);
+        BinaryProtocol bp = lm.getBinaryProtocol();
+        IniFileModel ini = bp == null ? null : bp.getIniFileNullable();
+        if (ini == null) {
+            return errorBody("No .ini model for this connection");
+        }
+        if ("list_maps".equals(operation)) {
+            return EcuMaps.list(ini, bp.signature);
+        }
+        FutureTask<JSONObject> task = new FutureTask<>(() -> {
+            if (closed || lm.getBinaryProtocol() != bp || bp.isClosed()) {
+                throw new IllegalStateException("ECU connection changed before map access");
+            }
+            return maps.access(bp, ini, args, operation);
+        });
+        lm.submit(task);
+        try {
+            return task.get();
+        } catch (java.util.concurrent.ExecutionException e) {
+            if (e.getCause() instanceof Exception) {
+                throw (Exception) e.getCause();
+            }
+            throw e;
+        } finally {
+            task.cancel(false);
+        }
     }
 
     @SuppressWarnings("unchecked")
@@ -1067,6 +1122,31 @@ public class EcuMcpServer {
             schema.put("required", req);
         }
         schema.put("additionalProperties", additional);
+        return schema;
+    }
+
+    @SuppressWarnings("unchecked")
+    private static JSONObject mapPatchSchema(boolean write) {
+        JSONObject schema = schemaObject(new String[][]{
+                {"id", "string", "Table ID from list_maps."},
+                {"row", "integer", "Zero-based starting row."},
+                {"column", "integer", "Zero-based starting column."},
+                {"values", "array", "Rectangular matrix of numeric values in read_map units."}
+        }, new String[]{"id", "row", "column", "values"}, false);
+        JSONObject properties = (JSONObject) schema.get("properties");
+        JSONObject value = new JSONObject();
+        value.put("type", "number");
+        JSONObject row = new JSONObject();
+        row.put("type", "array");
+        row.put("items", value);
+        ((JSONObject) properties.get("values")).put("items", row);
+        if (write) {
+            JSONObject options = schemaObject(new String[][]{
+                    {"persist", "boolean", "Request a flash burn for the whole page. Default false."},
+                    {"expectedRevision", "string", "Revision from preview_map_write or read_map."}
+            }, new String[]{}, false);
+            properties.putAll((JSONObject) options.get("properties"));
+        }
         return schema;
     }
 
