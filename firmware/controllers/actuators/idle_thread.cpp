@@ -15,6 +15,7 @@
 #if EFI_IDLE_CONTROL
 #include "idle_thread.h"
 #include "idle_hardware.h"
+#include "electronic_throttle.h"
 
 #include "dc_motors.h"
 
@@ -438,6 +439,11 @@ float IdleController::getIdlePosition(float rpm) {
 		// On failed sensor, use 0 deg C - should give a safe highish idle
 		float clt = Sensor::getOrZero(SensorType::Clt);
 		auto tps = Sensor::get(SensorType::DriverThrottleIntent);
+#if EFI_ELECTRONIC_THROTTLE_BODY
+		if (hasSdtv() && config->sdtvIdleControl) {
+			tps = Sensor::get(config->sdtvUsePps ? SensorType::AcceleratorPedal : SensorType::Tps1);
+		}
+#endif
 
 		// Compute the target we're shooting for
 		auto targetRpm = getTargetRpm(clt);
@@ -539,7 +545,15 @@ void IdleController::onFastCallback() {
 #if EFI_SHAFT_POSITION_INPUT
 	float position = getIdlePosition(engine->triggerCentral.instantRpm.getInstantRpm());
 	// Send the resulting percentage to the actual IAC actuator (stepper / DC motor / PWM solenoid)
-	applyIACposition(position);
+#if EFI_ELECTRONIC_THROTTLE_BODY
+	if (hasSdtv() && config->sdtvIdleControl) {
+		const auto phase = getCurrentPhase();
+		publishSdtvIdlePosition(position, phase == Phase::Cranking || phase == Phase::CrankToIdleTaper || phase == Phase::Idling);
+	} else
+#endif
+	{
+		applyIACposition(position);
+	}
 	// huh: why not onIgnitionStateChanged?
 	engine->m_ltit.checkIfShouldSave();
 #endif // EFI_SHAFT_POSITION_INPUT

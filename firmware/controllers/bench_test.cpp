@@ -670,6 +670,12 @@ static void handleCommandX14(uint16_t index) {
 	case TS_ETB_BENCH_TEST_1:
 		etbBenchTestStart(1);
 		return;
+	case TS_SDTV_AUTOCAL:
+		etbAutocal(DC_Sdtv);
+		return;
+	case TS_SDTV_CANCEL_AUTOCAL:
+		cancelSdtvAutocal();
+		return;
 	case TS_ETB_START_AUTOTUNE:
 			engine->etbAutoTune = true;
 		return;

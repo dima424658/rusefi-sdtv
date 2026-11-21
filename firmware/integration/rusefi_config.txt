@@ -1166,7 +1166,7 @@ include_file controllers/algo/accel_enrichment.engineConfiguration.txt
 
 	output_pin_e[TCU_SOLENOID_COUNT iterate] tcu_solenoid;
 
-	custom dc_function_e 1 bits, U08, @OFFSET@, [0:2], "None", "Throttle 1", "Throttle 2", "Idle Valve", "Wastegate", "GPIO (uaEFI only)"
+	custom dc_function_e 1 bits, U08, @OFFSET@, [0:2], "None", "Throttle 1", "Throttle 2", "Idle Valve", "Wastegate", "GPIO (uaEFI only)", "Suzuki SDTV"
 	dc_function_e[ETB_COUNT iterate] etbFunctions
 
 	spi_device_e drv8860spiDevice;
@@ -1301,6 +1301,7 @@ custom pin_mode_e 1 bits, U08, @OFFSET@, [0:6], $pin_mode_e_enum
 	float wwaeTau;Evaporation time constant for the Basic fuel-film model, in seconds. Higher values make the film respond more slowly. This is an exponential time constant, not the time for all deposited fuel to evaporate. Effective values below 0.01 bypass compensation.;"Seconds", 1, 0, 0, 3, 2
 	pid_s alternatorControl;
 	pid_s etb;
+	pid_s sdtvPid;
 	int16_t airTaperRpmRange;RPM range above upper limit for extra air taper;"RPM", 1, 0, 0, 1500, 0
 	brain_input_pin_e turboSpeedSensorInputPin;
 	!todo: extract these two fields into a structure\nSee also tps2_1AdcChannel
@@ -2136,6 +2137,16 @@ uint16_t[BOOST_LOAD_COUNT] boostOpenLoopLoadBins;;"", 1, 0, 0, @@MAP_UPPER_LIMIT
 
 uint8_t[BOOST_LOAD_COUNT x BOOST_RPM_COUNT] autoscale boostTableClosedLoop;;"", 2, 0, 0, 510, 0
 uint16_t[BOOST_LOAD_COUNT] boostClosedLoopLoadBins;;"", 1, 0, 0, @@MAP_UPPER_LIMIT@@, 0
+
+uint8_t sdtvUsePps;"Driver demand input";"boolean", 1, 0, 0, 1, 0
+uint8_t sdtvIdleControl;"Use SDTV as idle actuator";"boolean", 1, 0, 0, 1, 0
+uint8_t sdtvMinPosition;;"%", 1, 0, 0, 100, 0
+uint8_t sdtvMaxPosition;;"%", 1, 0, 0, 100, 0
+uint8_t sdtvIdleMinPosition;;"%", 1, 0, 0, 100, 0
+uint8_t sdtvIdleMaxPosition;;"%", 1, 0, 0, 100, 0
+uint8_t[PEDAL_TO_TPS_SIZE x PEDAL_TO_TPS_RPM_SIZE] sdtvTable;;"%", 1, 0, 0, 100, 0
+uint8_t[PEDAL_TO_TPS_SIZE] sdtvDemandBins;;"%", 1, 0, 0, 100, 0
+uint8_t[PEDAL_TO_TPS_RPM_SIZE] autoscale sdtvRpmBins;;"RPM", @@RPM_AS_BYTE_SCALE@@, 0, 0, @@RPM_AS_BYTE_LIMIT@@, 0
 
 uint8_t[PEDAL_TO_TPS_SIZE x PEDAL_TO_TPS_RPM_SIZE] pedalToTpsTable;;"%", 1, 0, 0, 100, 0
 uint8_t[PEDAL_TO_TPS_SIZE] pedalToTpsPedalBins;;"%", 1, 0, 0, 120, 0

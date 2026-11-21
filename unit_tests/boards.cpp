@@ -36,5 +36,5 @@ expected<float> adcGetRawVoltage(const char *msg, adc_channel_e hwChannel) {
 
 // voltage in ECU universe, with all input dividers and OpAmps gains taken into account, voltage at ECU connector pin
 expected<float> adcGetScaledVoltage(const char *msg, adc_channel_e hwChannel) {
-	return expected(0.0f);
+	return adcGetRawVoltage(msg, hwChannel);
 }

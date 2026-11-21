@@ -78,9 +78,18 @@ public:
 	virtual void update() = 0;
 	virtual void autoCalibrateTps(bool reportToTs = true) { (void)reportToTs; }
 	virtual void startBenchTest() {}
+	virtual void cancelSdtvEndpointCalibration() {}
 	virtual bool isEtbMode() const = 0;
 
 	virtual const pid_state_s& getPidState() const = 0;
   virtual float getCurrentTarget() const = 0;
 	virtual void setLuaAdjustment(percent_t adjustment) = 0;
 };
+
+bool isSdtvStationary();
+
+#if EFI_ELECTRONIC_THROTTLE_BODY
+bool hasSdtv();
+void cancelSdtvAutocal();
+void publishSdtvIdlePosition(float position, bool active);
+#endif

@@ -41,6 +41,10 @@
 
 #if EFI_ELECTRONIC_THROTTLE_BODY
 
+#include <atomic>
+#if EFI_IDLE_CONTROL
+#include "idle_thread.h"
+#endif
 #include "dc_motor.h"
 #include "dc_motors.h"
 #include "defaults.h"
@@ -65,6 +69,34 @@
 #endif
 
 static pedal2tps_t pedal2tpsMap{"p2t"};
+static pedal2tps_t sdtvMap{"sdtv"};
+static std::atomic<int> sdtvIdleRequest{-1};
+
+bool hasSdtv() {
+	for (auto function : engineConfiguration->etbFunctions) {
+		if (function == DC_Sdtv) {
+			return true;
+		}
+	}
+	return false;
+}
+
+void publishSdtvIdlePosition(float position, bool active) {
+	sdtvIdleRequest.store(active && std::isfinite(position) ? int(clampPercentValue(position) * 100) : -1);
+}
+
+bool isSdtvStationary() {
+#if EFI_SHAFT_POSITION_INPUT
+	return engine->rpmCalculator.isStopped() && !engine->triggerCentral.engineMovedRecently();
+#else
+	return false;
+#endif
+}
+
+static SensorResult getSdtvDemand() {
+	return Sensor::get(config->sdtvUsePps ? SensorType::AcceleratorPedal : SensorType::Tps1);
+}
+
 static Map3D<ETB2_TRIM_RPM_SIZE, ETB2_TRIM_SIZE, int8_t, uint8_t, uint8_t> throttle2TrimTable{"t2t"};
 static Map3D<TRACTION_CONTROL_ETB_DROP_SLIP_SIZE, TRACTION_CONTROL_ETB_DROP_SPEED_SIZE, int8_t, uint16_t, uint8_t> tcEtbDropTable{"tce"};
 
@@ -88,6 +120,7 @@ static SensorType functionToPositionSensor(dc_function_e func) {
 	switch(func) {
 		case DC_Throttle1: return SensorType::Tps1;
 		case DC_Throttle2: return SensorType::Tps2;
+		case DC_Sdtv: return SensorType::Tps2Primary;
 		case DC_IdleValve: return SensorType::IdlePosition;
 		case DC_Wastegate: return SensorType::WastegatePosition;
 		default: return SensorType::Invalid;
@@ -98,6 +131,7 @@ static SensorType functionToTpsSensor(dc_function_e func) {
 	switch(func) {
 		case DC_Throttle1: return SensorType::Tps1;
 		case DC_Throttle2: return SensorType::Tps2;
+		case DC_Sdtv: return SensorType::Tps2Primary;
 		case DC_IdleValve: return SensorType::IdlePosition;
 		case DC_Wastegate: return SensorType::WastegatePosition;
 		default: return SensorType::Invalid;
@@ -107,7 +141,8 @@ static SensorType functionToTpsSensor(dc_function_e func) {
 static SensorType functionToTpsSensorPrimary(dc_function_e func) {
 	switch(func) {
 		case DC_Throttle1: return SensorType::Tps1Primary;
-		case DC_Throttle2: return SensorType::Tps2Primary;
+		case DC_Throttle2:
+		case DC_Sdtv: return SensorType::Tps2Primary;
 		case DC_IdleValve: return SensorType::IdlePosition;
 		case DC_Wastegate: return SensorType::WastegatePosition;
 		default: return SensorType::Invalid;
@@ -127,7 +162,8 @@ static SensorType functionToTpsSensorSecondary(dc_function_e func) {
 static TsCalMode functionToCalModePriMin(dc_function_e func) {
 	switch (func) {
 		case DC_Throttle1: return TsCalMode::Tps1Min;
-		case DC_Throttle2: return TsCalMode::Tps2Min;
+		case DC_Throttle2:
+		case DC_Sdtv: return TsCalMode::Tps2Min;
 		case DC_Wastegate: return TsCalMode::EwgPosMin;
 		default: return TsCalMode::None;
 	}
@@ -136,7 +172,8 @@ static TsCalMode functionToCalModePriMin(dc_function_e func) {
 static TsCalMode functionToCalModePriMax(dc_function_e func) {
 	switch (func) {
 		case DC_Throttle1: return TsCalMode::Tps1Max;
-		case DC_Throttle2: return TsCalMode::Tps2Max;
+		case DC_Throttle2:
+		case DC_Sdtv: return TsCalMode::Tps2Max;
 		case DC_Wastegate: return TsCalMode::EwgPosMax;
 		default: return TsCalMode::None;
 	}
@@ -264,6 +301,8 @@ expected<percent_t> EtbController::getSetpoint() {
 		case DC_Throttle1:
 		case DC_Throttle2:
 			return getSetpointEtb();
+		case DC_Sdtv:
+			return getSdtvTarget();
 		case DC_IdleValve:
 			return getSetpointIdleValve();
 		case DC_Wastegate:
@@ -298,6 +337,61 @@ float getSanitizedPedal() {
 
 PUBLIC_API_WEAK float boardAdjustEtbTarget(float currentEtbTarget) {
   return currentEtbTarget;
+}
+
+expected<percent_t> EtbController::getSdtvTarget() {
+	if (m_isAutotune) {
+		float target = (config->sdtvMinPosition + config->sdtvMaxPosition) * 0.5f;
+#if EFI_TUNER_STUDIO
+		engine->outputChannels.sdtvTarget = target;
+		engine->outputChannels.sdtvMode = 3;
+#endif
+		return target;
+	}
+	auto demand = getSdtvDemand();
+	if (!demand || !std::isfinite(demand.Value)) {
+		return unexpected;
+	}
+
+	const auto increasing = [](const auto& bins) {
+		for (size_t i = 1; i < efi::size(bins); i++) {
+			if (!(bins[i] > bins[i - 1])) {
+				return false;
+			}
+		}
+		return true;
+	};
+
+	int idle = sdtvIdleRequest.load();
+#if EFI_SHAFT_POSITION_INPUT && EFI_IDLE_CONTROL
+	auto rotation = engine->rpmCalculator.getState();
+	if (config->sdtvIdleControl && (rotation == CRANKING || rotation == SPINNING_UP)) {
+		auto clt = Sensor::getOrZero(SensorType::Clt);
+		idle = static_cast<int>(clampPercentValue(engine->module<IdleController>()->getCrankingOpenLoop(clt)) * 100);
+	}
+#endif
+	float target;
+	if (config->sdtvIdleControl && idle >= 0) {
+		if (config->sdtvIdleMinPosition > config->sdtvIdleMaxPosition || config->sdtvIdleMaxPosition > 100) {
+			etbErrorCode = (int8_t)EtbStatus::NotConfigured;
+			return unexpected;
+		}
+		target = interpolateClamped(0, config->sdtvIdleMinPosition, 10000, config->sdtvIdleMaxPosition, idle);
+	} else {
+		auto rpm = Sensor::get(SensorType::Rpm);
+		if (!rpm || !std::isfinite(rpm.Value) || !increasing(config->sdtvRpmBins) || !increasing(config->sdtvDemandBins)) {
+			etbErrorCode = (int8_t)EtbStatus::NotConfigured;
+			return unexpected;
+		}
+		target = sdtvMap.getValue(rpm.Value, clampPercentValue(demand.Value));
+	}
+	target = clampF(config->sdtvMinPosition, target, config->sdtvMaxPosition);
+	m_adjustedTarget = target;
+#if EFI_TUNER_STUDIO
+	engine->outputChannels.sdtvTarget = target;
+	engine->outputChannels.sdtvMode = config->sdtvIdleControl && idle >= 0 ? 2 : 1;
+#endif
+	return target;
 }
 
 expected<percent_t> EtbController::getSetpointEtb() {
@@ -482,13 +576,13 @@ expected<percent_t> EtbController::getClosedLoopAutotune(percent_t target, perce
 
 		switch (m_autotuneCurrentParam) {
 		case 0:
-			tsCalibrationSetData(TsCalMode::EtbKp, kp);
+			tsCalibrationSetData(m_function == DC_Sdtv ? TsCalMode::SdtvKp : TsCalMode::EtbKp, kp);
 			break;
 		case 1:
-			tsCalibrationSetData(TsCalMode::EtbKi, ki);
+			tsCalibrationSetData(m_function == DC_Sdtv ? TsCalMode::SdtvKi : TsCalMode::EtbKi, ki);
 			break;
 		case 2:
-			tsCalibrationSetData(TsCalMode::EtbKd, kd);
+			tsCalibrationSetData(m_function == DC_Sdtv ? TsCalMode::SdtvKd : TsCalMode::EtbKd, kd);
 			break;
 		}
 
@@ -552,11 +646,11 @@ void EtbController::setOutput(expected<percent_t> outputValue) {
 	}
 
 	bool isEnabled;
-	if (!isEtbMode()) {
+	if (!isEtbMode() && m_function != DC_Sdtv) {
 	  // technical debt: non-ETB usages of DC motor are still mixed into ETB controller?
 		state = (uint8_t)EtbState::NotEbt;
 		isEnabled = true;
-	} else if (!getLimpManager()->allowElectronicThrottle()) {
+	} else if (!getLimpManager()->allowElectronicThrottle() || (m_function == DC_Sdtv && m_sdtvFault != EtbStatus::None)) {
 		state = (uint8_t)EtbState::LimpProhibited;
 		isEnabled = false;
 	} else if (engineConfiguration->pauseEtbControl) {
@@ -570,6 +664,21 @@ void EtbController::setOutput(expected<percent_t> outputValue) {
 		isEnabled = true;
 	}
 
+#if EFI_TUNER_STUDIO
+	if (m_function == DC_Sdtv) {
+		engine->outputChannels.sdtvDuty = isEnabled ? outputValue.value_or(0) : 0;
+		engine->outputChannels.sdtvFault = m_sdtvFault != EtbStatus::None ? (uint8_t)m_sdtvFault : etbErrorCode;
+		if (!isEnabled) {
+			engine->outputChannels.sdtvMode = 0;
+		}
+	}
+#endif
+	if (m_function == DC_Sdtv && !isEnabled) {
+		m_shouldResetPid = true;
+		m_cycleTimer.reset();
+		m_jamDetectTimer.reset();
+	}
+
 	// If not ETB, or ETB is allowed, output is valid, and we aren't paused, output to motor.
 	if (isEnabled) {
 		m_motor->enable();
@@ -580,7 +689,89 @@ void EtbController::setOutput(expected<percent_t> outputValue) {
 	}
 }
 
+bool EtbController::checkSdtvStatus() {
+	etbErrorCode = (int8_t)EtbStatus::None;
+#if EFI_SHAFT_POSITION_INPUT
+	const bool moving = engine->rpmCalculator.getState() != STOPPED && engine->triggerCentral.engineMovedRecently();
+#else
+	const bool moving = false;
+#endif
+	auto position = Sensor::get(m_positionSensor);
+	auto demand = getSdtvDemand();
+#if EFI_TUNER_STUDIO
+	engine->outputChannels.sdtvDemand = demand.value_or(0);
+	engine->outputChannels.sdtvPosition = position.value_or(0);
+#endif
+	if (m_sdtvFault != EtbStatus::None || !getLimpManager()->allowElectronicThrottle()) {
+		etbErrorCode = (int8_t)(m_sdtvFault != EtbStatus::None ? m_sdtvFault : EtbStatus::JamDetected);
+		return false;
+	}
+	const bool wasAutotuning = m_isAutotune;
+	m_isAutotune = engine->etbAutoTune && isSdtvStationary();
+	if (m_isAutotune && !wasAutotuning) {
+		m_sdtvAutotuneTimer.reset();
+		m_cycleTimer.reset();
+		m_lastIsPositive = false;
+		m_minCycleTps = 100;
+		m_maxCycleTps = 0;
+		m_a = 8;
+		m_tu = 0.1f;
+#if EFI_TUNER_STUDIO
+		m_autotuneCounter = 0;
+		m_autotuneCurrentParam = 0;
+#endif
+	}
+	if ((engine->etbAutoTune && (!m_isAutotune || m_sdtvAutotuneTimer.hasElapsedSec(20)))
+			|| (m_isAutotune && engineConfiguration->pauseEtbControl)) {
+		engine->etbAutoTune = false;
+		m_isAutotune = false;
+#if EFI_TUNER_STUDIO
+		tsCalibrationSetIdle();
+#endif
+		return false;
+	}
+	if (wasAutotuning && !m_isAutotune) {
+		m_shouldResetPid = true;
+	}
+	if ((!moving && !m_isAutotune) || engineConfiguration->pauseEtbControl) {
+		etbErrorCode = (int8_t)EtbStatus::EngineStopped;
+		return false;
+	}
+	if (!position || !std::isfinite(position.Value)
+		|| (!m_isAutotune && (!demand || !std::isfinite(demand.Value)))) {
+		etbErrorCode = (int8_t)(position && std::isfinite(position.Value) ? EtbStatus::PpsError : EtbStatus::TpsError);
+		if (m_isAutotune) {
+			engine->etbAutoTune = false;
+			m_isAutotune = false;
+		}
+		if (moving && engine->module<SensorChecker>()->analogSensorsShouldWork()) {
+			m_sdtvFault = static_cast<EtbStatus>(etbErrorCode);
+			getLimpManager()->reportEtbJammed();
+		}
+		return false;
+	}
+	const auto& pid = engineConfiguration->sdtvPid;
+	const bool travelValid = config->sdtvMinPosition < config->sdtvMaxPosition && config->sdtvMaxPosition <= 100;
+	if (m_isAutotune && (!travelValid || position.Value <= config->sdtvMinPosition || position.Value >= config->sdtvMaxPosition)) {
+		engine->etbAutoTune = false;
+		m_isAutotune = false;
+#if EFI_TUNER_STUDIO
+		tsCalibrationSetIdle();
+#endif
+		return false;
+	}
+	if (!travelValid || (!m_isAutotune && (!std::isfinite(pid.pFactor) || pid.pFactor <= 0
+			|| !std::isfinite(pid.iFactor) || !std::isfinite(pid.dFactor) || pid.minValue >= 0 || pid.maxValue <= 0))) {
+		etbErrorCode = (int8_t)EtbStatus::NotConfigured;
+		return false;
+	}
+	return true;
+}
+
 bool EtbController::checkStatus() {
+	if (m_function == DC_Sdtv) {
+		return checkSdtvStatus();
+	}
 #if EFI_TUNER_STUDIO
 	// Only debug throttle #1
 	if (m_function == DC_Throttle1) {
@@ -667,6 +858,16 @@ void EtbController::update() {
 		// If engine is stopped and so configured, skip the ETB update entirely
 		// This is quieter and pulls less power than leaving it on all the time
 		m_motor->disable("etb status");
+		if (m_function == DC_Sdtv) {
+			m_shouldResetPid = true;
+			m_cycleTimer.reset();
+			m_jamDetectTimer.reset();
+#if EFI_TUNER_STUDIO
+			engine->outputChannels.sdtvMode = 0;
+			engine->outputChannels.sdtvDuty = 0;
+			engine->outputChannels.sdtvFault = etbErrorCode;
+#endif
+		}
 		return;
 	}
 
@@ -681,7 +882,11 @@ void EtbController::checkJam(percent_t setpoint, percent_t observation) {
 	float absError = std::abs(setpoint - observation);
 
 	auto jamDetectThreshold = engineConfiguration->etbJamDetectThreshold;
-	auto jamTimeout = engineConfiguration->etbJamTimeout;
+	float jamTimeout = engineConfiguration->etbJamTimeout;
+	if (m_function == DC_Sdtv) {
+		jamDetectThreshold = jamDetectThreshold > 0 ? jamDetectThreshold : 10;
+		jamTimeout = jamTimeout > 0 ? jamTimeout : 1;
+	}
 
 	if (jamDetectThreshold != 0 && jamTimeout != 0) {
 		auto nowNt = getTimeNowNt();
@@ -690,6 +895,9 @@ void EtbController::checkJam(percent_t setpoint, percent_t observation) {
 			if (m_jamDetectTimer.hasElapsedSec(jamTimeout)) {
 				efiPrintf(" ************* ETB is jammed! ***************");
 				jamDetected = true;
+				if (m_function == DC_Sdtv) {
+					m_sdtvFault = EtbStatus::JamDetected;
+				}
 
 				getLimpManager()->reportEtbJammed();
 			}
@@ -783,6 +991,12 @@ void etbPidReset() {
 }
 #endif // EFI_UNIT_TEST
 
+void cancelSdtvAutocal() {
+	for (auto controller : etbControllers) {
+		controller->cancelSdtvEndpointCalibration();
+	}
+}
+
 void etbAutocal(dc_function_e function, bool reportToTs) {
 	for (size_t i = 0 ; i < ETB_COUNT; i++) {
 		/* TODO: use from engine, add getFunction() to base class */
@@ -851,6 +1065,11 @@ void setDefaultEtbParameters() {
 
 	setLinearCurve(config->pedalToTpsPedalBins, /*from*/0, /*to*/100, 1);
 	setRpmTableBin(config->pedalToTpsRpmBins);
+	setLinearCurve(config->sdtvDemandBins, 0, 100, 1);
+	setRpmTableBin(config->sdtvRpmBins);
+	config->sdtvMaxPosition = 100;
+	engineConfiguration->sdtvPid.minValue = -30;
+	engineConfiguration->sdtvPid.maxValue = 30;
 
 	for (int pedalIndex = 0;pedalIndex<PEDAL_TO_TPS_SIZE;pedalIndex++) {
 		for (int rpmIndex = 0;rpmIndex<PEDAL_TO_TPS_RPM_SIZE;rpmIndex++) {
@@ -891,7 +1110,8 @@ void onConfigurationChangeElectronicThrottleCallback(engine_configuration_s *pre
 	}
 
 	for (int i = 0; i < ETB_COUNT; i++) {
-		etbControllers[i]->onConfigurationChange(&previousConfiguration->etb);
+		etbControllers[i]->onConfigurationChange(engineConfiguration->etbFunctions[i] == DC_Sdtv
+			? &previousConfiguration->sdtvPid : &previousConfiguration->etb);
 	}
 }
 
@@ -916,6 +1136,7 @@ void unregisterEtbPins() {
 static pid_s* getPidForDcFunction(dc_function_e function) {
 	switch (function) {
 		case DC_Wastegate: return &engineConfiguration->etbWastegatePid;
+		case DC_Sdtv: return &engineConfiguration->sdtvPid;
 		default: return &engineConfiguration->etb;
 	}
 }
@@ -926,6 +1147,21 @@ PUBLIC_API_WEAK ValueProvider3D* pedal2TpsProvider() {
 
 void doInitElectronicThrottle(bool isStartupInit) {
 	bool anyEtbConfigured = false;
+	if (hasSdtv()) {
+		int sdtvCount = 0;
+		bool incompatible = engineConfiguration->useHbridgesToDriveIdleStepper;
+		for (auto function : engineConfiguration->etbFunctions) {
+			sdtvCount += function == DC_Sdtv;
+			incompatible |= function == DC_Throttle1 || function == DC_Throttle2
+				|| (config->sdtvIdleControl && function == DC_IdleValve);
+		}
+		if (sdtvCount != 1 || incompatible || (config->sdtvIdleControl
+				&& (engineConfiguration->modeledFlowIdle || engineConfiguration->useStepperIdle
+					|| !EFI_IDLE_CONTROL || isBrainPinValid(engineConfiguration->idle.solenoidPin)))) {
+			configError("SDTV requires exclusive throttle and idle actuator assignments");
+			return;
+		}
+	}
 
 	// todo: technical debt: we still have DC motor code initialization in ETB-specific file while DC motors are used not just as ETB
 	// like DC motor wastegate code flow should probably NOT go through electronic_throttle.cpp right?
@@ -945,8 +1181,20 @@ void doInitElectronicThrottle(bool isStartupInit) {
 			continue;
 		#endif
 		}
+		if (func == DC_Sdtv) {
+			const auto& io = engineConfiguration->etbIo[i];
+			if (!isBrainPinValid(io.directionPin1) || !isBrainPinValid(io.directionPin2)
+					|| io.directionPin1 == io.directionPin2
+					|| (!engineConfiguration->etb_use_two_wires && !isBrainPinValid(io.controlPin))) {
+				configError("SDTV H-bridge pins are incomplete");
+				continue;
+			}
+		}
 		auto motor = initDcMotor("ETB disable",
 				engineConfiguration->etbIo[i], i, engineConfiguration->etb_use_two_wires);
+		if (isStartupInit && func == DC_Sdtv) {
+			motor->disable("SDTV startup");
+		}
 
 		auto controller = engine->etbControllers[i];
 		criticalAssertVoid(controller != nullptr, "null ETB");
@@ -957,7 +1205,7 @@ void doInitElectronicThrottle(bool isStartupInit) {
 		if (isStartupInit && dcConfigured) {
 			controller->reset("init");
 		}
-		anyEtbConfigured |= dcConfigured && controller->isEtbMode();
+		anyEtbConfigured |= dcConfigured && (controller->isEtbMode() || func == DC_Sdtv);
 	}
 
 	// It's not valid to have a PPS without any ETBs - check that at least one ETB was enabled along with the pedal
@@ -988,6 +1236,7 @@ void doInitElectronicThrottle(bool isStartupInit) {
 }
 
 void initElectronicThrottle() {
+	sdtvIdleRequest.store(-1);
 	if (hasFirmwareError()) {
 		return;
 	}
@@ -1024,6 +1273,7 @@ void initElectronicThrottle() {
 
 #endif /* EFI_PROD_CODE */
 
+	sdtvMap.initTable(config->sdtvTable, config->sdtvRpmBins, config->sdtvDemandBins);
 	pedal2tpsMap.initTable(config->pedalToTpsTable, config->pedalToTpsRpmBins, config->pedalToTpsPedalBins);
 	throttle2TrimTable.initTable(config->throttle2TrimTable, config->throttle2TrimRpmBins, config->throttle2TrimTpsBins);
 	tcEtbDropTable.initTable(engineConfiguration->tractionControlEtbDrop, engineConfiguration->tractionControlSlipBins, engineConfiguration->tractionControlSpeedBins);

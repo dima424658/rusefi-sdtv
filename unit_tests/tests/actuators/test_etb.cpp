@@ -12,6 +12,7 @@
 #include "idle_thread.h"
 
 #include "mocks.h"
+#include "boards.h"
 
 using ::testing::_;
 using ::testing::Ne;
@@ -462,6 +463,130 @@ TEST(etb, setpointNoPedalMap) {
 	etb.init(DC_Throttle1, nullptr, nullptr, nullptr);
 
 	EXPECT_EQ(etb.getSetpoint(), unexpected);
+}
+
+TEST(sdtv, selectsDemandAndHandsOffFromIdleToLiveMap) {
+	EngineTestHelper eth(engine_type_e::TEST_ENGINE);
+	EtbController actuator;
+	ASSERT_TRUE(actuator.init(DC_Sdtv, nullptr, &engineConfiguration->sdtvPid, nullptr));
+
+	config->sdtvMinPosition = 2;
+	config->sdtvMaxPosition = 80;
+	for (size_t row = 0; row < efi::size(config->sdtvDemandBins); row++) {
+		config->sdtvDemandBins[row] = row * 10;
+		for (size_t col = 0; col < efi::size(config->sdtvRpmBins); col++) {
+			config->sdtvTable[row][col] = row * 10 + col * 5;
+			config->sdtvRpmBins[col] = col * 1000;
+		}
+	}
+	Sensor::setMockValue(SensorType::Rpm, 1500);
+	Sensor::setMockValue(SensorType::Tps1, 5);
+	Sensor::setMockValue(SensorType::AcceleratorPedal, 35);
+	Sensor::setMockValue(SensorType::Tps2Primary, 12);
+	EXPECT_FLOAT_EQ(12, actuator.observePlant().value_or(-1));
+	EXPECT_FLOAT_EQ(12.5f, actuator.getSetpoint().value_or(-1));
+
+	config->sdtvUsePps = 1;
+	EXPECT_FLOAT_EQ(42.5f, actuator.getSetpoint().value_or(-1));
+	config->sdtvIdleControl = 1;
+	config->sdtvIdleMinPosition = 3;
+	config->sdtvIdleMaxPosition = 13;
+	publishSdtvIdlePosition(50, true);
+	EXPECT_FLOAT_EQ(8, actuator.getSetpoint().value_or(-1));
+	publishSdtvIdlePosition(50, false);
+	EXPECT_FLOAT_EQ(42.5f, actuator.getSetpoint().value_or(-1));
+
+	config->sdtvMaxPosition = 35;
+	EXPECT_FLOAT_EQ(35, actuator.getSetpoint().value_or(-1));
+	config->sdtvDemandBins[2] = config->sdtvDemandBins[1];
+	EXPECT_FALSE(actuator.getSetpoint().Valid);
+}
+
+TEST(sdtv, crankingUsesCoolantCurveAndStandstillDisablesDrive) {
+	EngineTestHelper eth(engine_type_e::TEST_ENGINE);
+	StrictMock<MockMotor> motor;
+	EtbController actuator;
+	ASSERT_TRUE(actuator.init(DC_Sdtv, &motor, &engineConfiguration->sdtvPid, nullptr));
+
+	EXPECT_CALL(motor, disable(_));
+	actuator.update();
+
+	config->sdtvIdleControl = 1;
+	config->sdtvIdleMinPosition = 0;
+	config->sdtvIdleMaxPosition = 20;
+	config->sdtvMaxPosition = 100;
+	for (size_t i = 0; i < efi::size(config->cltCrankingCorrBins); i++) {
+		config->cltCrankingCorrBins[i] = static_cast<float>(i) * 10;
+		config->cltCrankingCorr[i] = 100 - static_cast<float>(i) * 10;
+	}
+	Sensor::setMockValue(SensorType::Tps1, 0);
+	engine->rpmCalculator.setRpmValue(100);
+	ASSERT_TRUE(engine->rpmCalculator.isCranking());
+	Sensor::setMockValue(SensorType::Clt, 0);
+	EXPECT_FLOAT_EQ(20, actuator.getSetpoint().value_or(-1));
+	Sensor::setMockValue(SensorType::Clt, 50);
+	EXPECT_FLOAT_EQ(10, actuator.getSetpoint().value_or(-1));
+}
+
+TEST(sdtv, calibratesOneRawTrackAndAbortsOnRotation) {
+	StrictMock<MockMotor> motor;
+	EngineTestHelper eth(engine_type_e::TEST_ENGINE);
+	auto& actuator = *engine->etbControllers[0];
+	ASSERT_TRUE(actuator.init(DC_Sdtv, &motor, &engineConfiguration->sdtvPid, nullptr));
+
+	const auto channel = EFI_ADC_1;
+	engineConfiguration->tps2_1AdcChannel = channel;
+	engineConfiguration->tps2Min = 0;
+	engineConfiguration->tps2Max = 0;
+	engineConfiguration->tps2SecondaryMin = 321;
+	setTimeNowUs(4'000'000);
+	setMockAdcVoltage(channel, 2);
+	actuator.autoCalibrateTps(false);
+	EXPECT_CALL(motor, set(0.5f)).WillOnce(Return(false));
+	EXPECT_CALL(motor, enable());
+	actuator.update();
+
+	setTimeNowUs(5'100'000);
+	setMockAdcVoltage(channel, 4);
+	EXPECT_CALL(motor, set(-0.5f)).WillOnce(Return(false));
+	actuator.update();
+
+	setTimeNowUs(6'200'000);
+	setMockAdcVoltage(channel, 1);
+	EXPECT_CALL(motor, disable(_));
+	actuator.update();
+	EXPECT_EQ(convertVoltageTo10bitADC(1), engineConfiguration->tps2Min);
+	EXPECT_EQ(convertVoltageTo10bitADC(4), engineConfiguration->tps2Max);
+	EXPECT_EQ(321, engineConfiguration->tps2SecondaryMin);
+
+	actuator.autoCalibrateTps(false);
+	EXPECT_CALL(motor, set(0.5f)).WillOnce(Return(false));
+	EXPECT_CALL(motor, enable());
+	actuator.update();
+	engine->triggerCentral.m_lastEventTimer.reset();
+	EXPECT_CALL(motor, disable(_));
+	actuator.update();
+}
+
+TEST(sdtv, jamLatchesDriveOffAndAppliesEtbFaultLimit) {
+	EngineTestHelper eth(engine_type_e::TEST_ENGINE);
+	MockIgnitionController ignition;
+	EXPECT_CALL(ignition, getIgnState).WillRepeatedly(Return(true));
+	engine->module<IgnitionController>().set(&ignition);
+	StrictMock<MockMotor> motor;
+	EtbController actuator;
+	ASSERT_TRUE(actuator.init(DC_Sdtv, &motor, &engineConfiguration->sdtvPid, nullptr));
+
+	setTimeNowUs(0);
+	actuator.checkJam(10, 10);
+	setTimeNowUs(1'100'000);
+	actuator.checkJam(40, 10);
+	EXPECT_TRUE(actuator.jamDetected);
+	EXPECT_CALL(motor, disable(_));
+	actuator.setOutput(25);
+	auto limp = getLimpManager();
+	limp->updateState(2000, getTimeNowNt());
+	EXPECT_EQ(ClearReason::EtbJammedRevLimit, limp->allowInjection().reason);
 }
 
 TEST(etb, setpointIdleValveController) {

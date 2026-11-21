@@ -8,6 +8,7 @@
 #include "linear_func.h"
 #include "tps.h"
 #include "tps_smoothing.h"
+#include "electronic_throttle.h"
 #include "auto_generated_sensor.h"
 #include "defaults.h"
 #include "board_overrides.h"
@@ -175,6 +176,10 @@ public:
 		m_pri.deinit();
 		m_sec.deinit();
 
+		unregisterPair(isFordTps, fordTps);
+	}
+
+	void unregisterPair(bool isFordTps, RedundantFordTps* fordTps) {
 		if (isFordTps && fordTps) {
 			fordTps->unregister();
 		} else {
@@ -292,20 +297,28 @@ void initTps() {
 					 maxTpsPps});
 		}
 
-		tps2.init(
-				isFordTps,
-				&fordTps2,
-				tpsSecondaryMaximum,
-				{engineConfiguration->tps2_1AdcChannel,
-				 (float)engineConfiguration->tps2Min,
-				 (float)engineConfiguration->tps2Max,
-				 minTpsPps,
-				 maxTpsPps},
-				{engineConfiguration->tps2_2AdcChannel,
-				 (float)engineConfiguration->tps2SecondaryMin,
-				 (float)engineConfiguration->tps2SecondaryMax,
-				 minTpsPps,
-				 maxTpsPps});
+		bool sdtv = false;
+#if EFI_ELECTRONIC_THROTTLE_BODY
+		sdtv = hasSdtv();
+#endif
+		// A fresh SDTV installation can capture endpoints from the raw ADC before TPS2 is calibrated.
+		if (!sdtv || std::abs((float)engineConfiguration->tps2Max - (float)engineConfiguration->tps2Min)
+				/ TPS_TS_CONVERSION >= getFuncPairAllowedSplit()) {
+			tps2.init(
+					isFordTps && !sdtv,
+					&fordTps2,
+					tpsSecondaryMaximum,
+					{engineConfiguration->tps2_1AdcChannel,
+					 (float)engineConfiguration->tps2Min,
+					 (float)engineConfiguration->tps2Max,
+					 minTpsPps,
+					 maxTpsPps},
+					{sdtv ? EFI_ADC_NONE : engineConfiguration->tps2_2AdcChannel,
+					 (float)engineConfiguration->tps2SecondaryMin,
+					 (float)engineConfiguration->tps2SecondaryMax,
+					 minTpsPps,
+					 maxTpsPps});
+		}
 
 		// Do not reserve resolved TPS slots with no native/raw source: existing Lua/CAN
 		// providers can continue to register Tps1/Tps2 directly in that configuration.
@@ -393,6 +406,7 @@ void deinitTps() {
 
 	analogTps1.deinit(isFordTps, &fordTps1);
 	tps2.deinit(isFordTps, &fordTps2);
+	tps2.unregisterPair(!isFordTps, &fordTps2);
 	pedal.deinit(isFordPps, &fordPps);
 
 #if EFI_SENT_SUPPORT

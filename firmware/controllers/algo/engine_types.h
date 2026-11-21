@@ -330,6 +330,8 @@ typedef enum {
 	TS_ETB_BENCH_TEST_0 = 0x24,
 	TS_ETB_BENCH_TEST_1 = 0x25,
 	TS_DTC_MANAGER_SHOT = 0x26,
+	TS_SDTV_AUTOCAL = 0x27,
+	TS_SDTV_CANCEL_AUTOCAL = 0x28,
 } ts_14_command;
 
 typedef enum {

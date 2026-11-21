@@ -816,6 +816,7 @@ typedef enum __attribute__ ((__packed__)) {
 	DC_Wastegate = 4,
 	// Uses one H-bridge terminal as an on/off output. The paired terminal must stay disconnected.
 	DC_Gpio = 5,
+	DC_Sdtv = 6,
 } dc_function_e;
 
 typedef enum __attribute__ ((__packed__)) {
@@ -885,6 +886,9 @@ enum class TsCalMode : uint8_t {
 	PedalMax = 13,
 	EwgPosMax = 14,
 	EwgPosMin = 15,
+	SdtvKp = 16,
+	SdtvKi = 17,
+	SdtvKd = 18,
 };
 
 enum class GearControllerMode : uint8_t {

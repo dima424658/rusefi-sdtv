@@ -11,6 +11,8 @@
 #include "electronic_throttle.h"
 
 #include "sensor.h"
+#include "adc_inputs.h"
+#include "adc_math.h"
 #include "efi_pid.h"
 #include "error_accumulator.h"
 #include "electronic_throttle_generated.h"
@@ -88,6 +90,9 @@ protected:
 	bool hadPpsError = false;
 
 	DcMotor* getMotor() { return m_motor; }
+	bool canCalibrateSdtv() const {
+		return m_sdtvFault == EtbStatus::None && isSdtvStationary();
+	}
 
 private:
 	dc_function_e m_function = DC_None;
@@ -102,6 +107,8 @@ private:
 	 * @return true if OK, false if should be disabled
 	 */
 	bool checkStatus();
+	bool checkSdtvStatus();
+	expected<percent_t> getSdtvTarget();
 
 	Timer m_jamDetectTimer;
 
@@ -112,6 +119,8 @@ private:
 
 	// This is set if automatic PID cal should be run
 	bool m_isAutotune = false;
+	EtbStatus m_sdtvFault = EtbStatus::None;
+	Timer m_sdtvAutotuneTimer;
 
 	// Autotune helpers
 	bool m_lastIsPositive = false;
@@ -220,9 +229,21 @@ public:
 		efiPrintf("ETB bench test: opening for 300ms");
 	}
 
+	void cancelSdtvEndpointCalibration() override {
+		if (TBase::getFunction() == DC_Sdtv && m_autocalPhase != ACPhase::Stopped) {
+			TBase::getMotor()->disable("SDTV calibration cancelled");
+			m_autocalPhase = ACPhase::Stopped;
+			tsCalibrationSetIdle();
+		}
+	}
+
 	void autoCalibrateTps(bool reportToTs) override {
+		if (TBase::getFunction() == DC_Sdtv && (!TBase::canCalibrateSdtv()
+				|| engine->etbAutoTune || m_autocalPhase != ACPhase::Stopped)) {
+			return;
+		}
 		// Only auto calibrate throttles
-		if (TBase::getFunction() == DC_Throttle1 || TBase::getFunction() == DC_Throttle2 || TBase::getFunction() == DC_Wastegate) {
+		if (TBase::getFunction() == DC_Throttle1 || TBase::getFunction() == DC_Throttle2 || TBase::getFunction() == DC_Wastegate || TBase::getFunction() == DC_Sdtv) {
 			m_isAutocalTs = reportToTs;
 			m_autocalPhase = ACPhase::Start;
 		}
@@ -230,7 +251,7 @@ public:
 
 	ACPhase doAutocal(ACPhase phase) {
 		// Don't allow if engine is running!
-		if (Sensor::getOrZero(SensorType::Rpm) > 0) {
+		if (TBase::getFunction() != DC_Sdtv && Sensor::getOrZero(SensorType::Rpm) > 0) {
 			efiPrintf(" ****************** ERROR: Not while RPM ********************");
 			return ACPhase::Stopped;
 		}
@@ -241,9 +262,24 @@ public:
 			return ACPhase::Stopped;
 		}
 
-		TBase::etbErrorCode = (uint8_t)EtbStatus::AutoCalibrate;
-
 		auto myFunction = TBase::getFunction();
+		float sdtvVoltage = 0;
+		if (myFunction == DC_Sdtv) {
+			auto channel = engineConfiguration->tps2_1AdcChannel;
+			if (!TBase::canCalibrateSdtv() || !isAdcChannelValid(channel) || engine->etbAutoTune) {
+				engine->etbAutoTune = false;
+				motor->disable("SDTV calibration interlock");
+				return ACPhase::Stopped;
+			}
+			auto voltage = adcGetScaledVoltage("SDTV TPS", channel);
+			if (!voltage || !std::isfinite(voltage.Value) || voltage.Value <= 0 || voltage.Value >= 5) {
+				motor->disable("SDTV calibration feedback");
+				return ACPhase::Stopped;
+			}
+			sdtvVoltage = voltage.Value;
+		}
+
+		TBase::etbErrorCode = (uint8_t)EtbStatus::AutoCalibrate;
 
 		switch (phase) {
 		case ACPhase::Start:
@@ -254,8 +290,8 @@ public:
 		case ACPhase::Open:
 			if (m_autocalTimer.hasElapsedMs(1000)) {
 				// Capture open position
-				m_primaryMax = Sensor::getRaw(functionToTpsSensorPrimary(myFunction));
-				m_secondaryMax = Sensor::getRaw(functionToTpsSensorSecondary(myFunction));
+				m_primaryMax = myFunction == DC_Sdtv ? sdtvVoltage : Sensor::getRaw(functionToTpsSensorPrimary(myFunction));
+				m_secondaryMax = myFunction == DC_Sdtv ? 0 : Sensor::getRaw(functionToTpsSensorSecondary(myFunction));
 
 				// Next: close the throttle
 				motor->set(-0.5f);
@@ -265,8 +301,8 @@ public:
 		case ACPhase::Close:
 			if (m_autocalTimer.hasElapsedMs(1000)) {
 				// Capture closed position
-				m_primaryMin = Sensor::getRaw(functionToTpsSensorPrimary(myFunction));
-				m_secondaryMin = Sensor::getRaw(functionToTpsSensorSecondary(myFunction));
+				m_primaryMin = myFunction == DC_Sdtv ? sdtvVoltage : Sensor::getRaw(functionToTpsSensorPrimary(myFunction));
+				m_secondaryMin = myFunction == DC_Sdtv ? 0 : Sensor::getRaw(functionToTpsSensorSecondary(myFunction));
 
 				// Disable the motor, we're done
 				motor->disable("autotune");
@@ -289,6 +325,9 @@ public:
 						engineConfiguration->tps2Max = convertVoltageTo10bitADC(m_primaryMax);
 						engineConfiguration->tps2SecondaryMin = convertVoltageTo10bitADC(m_secondaryMin);
 						engineConfiguration->tps2SecondaryMax = convertVoltageTo10bitADC(m_secondaryMax);
+					} else if (myFunction == DC_Sdtv) {
+						engineConfiguration->tps2Min = convertVoltageTo10bitADC(m_primaryMin);
+						engineConfiguration->tps2Max = convertVoltageTo10bitADC(m_primaryMax);
 					} else if (myFunction == DC_Wastegate) {
 						engineConfiguration->wastegatePositionClosedVoltage = m_primaryMin;
 						engineConfiguration->wastegatePositionOpenedVoltage = m_primaryMax;
@@ -311,6 +350,9 @@ public:
 			break;
 		case ACPhase::TransmitPrimaryMin:
 			if (tsCalibrationIsIdle()) {
+				if (myFunction == DC_Sdtv) {
+					return ACPhase::Stopped;
+				}
 				tsCalibrationSetData(functionToCalModeSecMax(myFunction), m_secondaryMax);
 				// No secondary sensor?
 				if (tsCalibrationIsIdle())
