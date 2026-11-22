@@ -17,6 +17,12 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class LinkManagerCompatibilityListenerTest {
     @Test
+    public void watchdogRetriesTcpEndpointsMissingFromSerialPortEnumeration() {
+        assertTrue(LinkManager.isPortAvailableForReconnect("29001", Collections.emptySet()));
+        assertTrue(LinkManager.isPortAvailableForReconnect("127.0.0.1:29001", Collections.emptySet()));
+    }
+
+    @Test
     public void canTransportsCanReconnectWithoutAppearingAsSerialPorts() {
         assertTrue(LinkManager.isCanPort("SLCAN:COM7"));
         assertTrue(LinkManager.isSpecialNotSerial("SLCAN:COM7"));

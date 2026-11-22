@@ -11,6 +11,7 @@ import com.opensr5.ini.field.IniField;
 import com.opensr5.ini.field.ScalarIniField;
 import com.rusefi.config.FieldType;
 import com.rusefi.binaryprotocol.BinaryProtocol;
+import com.rusefi.io.LinkManager;
 import com.rusefi.io.UpdateOperationCallbacks;
 import com.rusefi.maintenance.CalibrationsHelper;
 import com.rusefi.maintenance.CalibrationsInfo;
@@ -34,6 +35,7 @@ import javax.swing.filechooser.FileNameExtensionFilter;
 import java.awt.*;
 import java.awt.event.ActionEvent;
 import java.io.File;
+import java.nio.ByteOrder;
 import java.util.ArrayDeque;
 import java.util.HashSet;
 import java.util.Map;
@@ -84,6 +86,7 @@ public class TuningToolbarWidget {
     private final Timer uploadTimer;
     private volatile boolean firmwareUpdateInProgress;
     private boolean burnInProgress;
+    private long appliedExternalRevision;
     private Runnable onBaselineChanged = () -> { };
     private long editGeneration;
     private volatile long connectionGeneration;
@@ -118,6 +121,7 @@ public class TuningToolbarWidget {
                         Consumer<Boolean> onLoadFinished,
                         Consumer<Runnable> submit) {
         this.uiContext = uiContext;
+        this.appliedExternalRevision = uiContext.getLinkManager().getExternalTuneRevision();
         this.submit = submit;
         this.sessionImage = sessionImage;
         this.baselineImage = baselineImage;
@@ -288,6 +292,7 @@ public class TuningToolbarWidget {
         final ConfigurationImage image = toBurn.clone();
         final long savedEditGeneration = editGeneration;
         final long savedConnectionGeneration = connectionGeneration;
+        final long tuneRevision = appliedExternalRevision;
         burnInProgress = true;
         burnButton.setEnabled(false);
         discardButton.setEnabled(false);
@@ -295,10 +300,15 @@ public class TuningToolbarWidget {
         try {
             submit.accept(() -> {
                 RuntimeException failure = null;
+                boolean superseded = tuneRevision != uiContext.getLinkManager().getExternalTuneRevision()
+                    || uiContext.getBinaryProtocol() != bp;
                 try {
-                    bp.uploadChangesWithoutBurn(image);
-                    bp.burn();
-                    bp.setConfigurationImage(image);
+                    if (!superseded) {
+                        bp.uploadChangesWithoutBurn(image);
+                        bp.burn();
+                        bp.setConfigurationImage(image);
+                        bp.cacheCurrentImage();
+                    }
                 } catch (RuntimeException ex) {
                     failure = ex;
                 }
@@ -314,7 +324,7 @@ public class TuningToolbarWidget {
                     burnButton.setEnabled(!firmwareUpdateInProgress && uiContext.getBinaryProtocol() != null);
                     discardButton.setEnabled(baselineImage != null);
                     loadTuneAction.setEnabled(!firmwareUpdateInProgress);
-                    if (!sameConnection) {
+                    if (!sameConnection || superseded) {
                         return;
                     }
                     if (operationFailure != null) {
@@ -341,6 +351,7 @@ public class TuningToolbarWidget {
     /** Call when ECU connects to enable the burn button. */
     public void onEcuConnected() {
         connectionGeneration++;
+        appliedExternalRevision = uiContext.getLinkManager().getExternalTuneRevision();
         burnButton.setEnabled(!burnInProgress);
         refreshState();
     }
@@ -376,9 +387,11 @@ public class TuningToolbarWidget {
             }
             ConfigurationImage snapshot = restoration.clone();
             long savedConnectionGeneration = connectionGeneration;
+            long tuneRevision = appliedExternalRevision;
             try {
                 submit.accept(() -> {
                     if (savedConnectionGeneration != connectionGeneration
+                            || tuneRevision != uiContext.getLinkManager().getExternalTuneRevision()
                             || uiContext.getBinaryProtocol() != bp
                             || firmwareUpdateInProgress || uiContext.isOfflineMode()) {
                         return;
@@ -422,8 +435,13 @@ public class TuningToolbarWidget {
             return;
         }
         final ConfigurationImage snapshot = image.clone();
+        long tuneRevision = appliedExternalRevision;
         try {
             submit.accept(() -> {
+                if (uiContext.getBinaryProtocol() != bp
+                        || tuneRevision != uiContext.getLinkManager().getExternalTuneRevision()) {
+                    return;
+                }
                 try {
                     bp.uploadChangesWithoutBurn(snapshot);
                 } catch (RuntimeException ex) {
@@ -434,6 +452,91 @@ public class TuningToolbarWidget {
         } catch (RuntimeException ex) {
             SwingUtilities.invokeLater(() ->
                 errorHandler.accept("Failed to upload tune: " + ex.getMessage()));
+        }
+    }
+
+    /** Incorporate an acknowledged ECU-side change without re-uploading old UI snapshots. */
+    public ConfigurationImage applyExternalTune(LinkManager.ExternalTuneChange change) {
+        appliedExternalRevision = change.revision;
+        flushBeforeNavigate();
+        uploadTimer.stop();
+        ConfigurationImage current = sessionImage.get();
+        ConfigurationImage updated = current == null || current.getSize() != change.after.getSize()
+            ? change.after.clone() : current.clone();
+        byte[] mask = changedSettingsMask(change);
+        applyExternalBytes(updated, change.after, mask);
+        undoStack.forEach(image -> applyExternalBytes(image, change.after, mask));
+        redoStack.forEach(image -> applyExternalBytes(image, change.after, mask));
+        sessionImage.set(updated);
+        if (change.burned) {
+            setBaselineImage(change.after);
+        } else {
+            refreshState();
+        }
+        if (!java.util.Arrays.equals(updated.getContent(), change.after.getContent())) {
+            uploadTimer.restart();
+        }
+        return updated;
+    }
+
+    private byte[] changedSettingsMask(LinkManager.ExternalTuneChange change) {
+        byte[] before = change.before.getContent();
+        byte[] after = change.after.getContent();
+        byte[] mask = new byte[after.length];
+        for (int i = 0; i < mask.length; i++) {
+            mask[i] = (byte) (before[i] ^ after[i]);
+        }
+        IniFileModel ini = uiContext.iniFileState.getIniFileModel();
+        if (ini == null) {
+            return mask;
+        }
+        for (IniField field : ini.getAllIniFields().values()) {
+            int offset = field.getOffset();
+            int size = field.getSize();
+            if (field.getPageIndex() != 0 || size <= 0 || offset < 0 || offset > mask.length - size) {
+                continue;
+            }
+            if (field instanceof EnumIniField) {
+                EnumIniField bits = (EnumIniField) field;
+                int position = bits.getBitPosition();
+                int width = bits.getBitSize0() + 1;
+                long fieldMask = ((1L << width) - 1) << position;
+                boolean littleEndian = change.after.getByteOrder() == ByteOrder.LITTLE_ENDIAN;
+                for (int i = 0; i < size; i++) {
+                    int shift = Byte.SIZE * (littleEndian ? i : size - i - 1);
+                    if (((before[offset + i] ^ after[offset + i]) & (fieldMask >>> shift) & 0xff) != 0) {
+                        for (int j = 0; j < size; j++) {
+                            int byteShift = Byte.SIZE * (littleEndian ? j : size - j - 1);
+                            mask[offset + j] |= (byte) (fieldMask >>> byteShift);
+                        }
+                        break;
+                    }
+                }
+                continue;
+            }
+            // Copy whole strings and scalar values, or individual elements of a map, on conflict.
+            int elementSize = field instanceof ArrayIniField
+                ? ((ArrayIniField) field).getType().getStorageSize() : size;
+            for (int start = offset; start < offset + size; start += elementSize) {
+                for (int i = start; i < start + elementSize; i++) {
+                    if (before[i] != after[i]) {
+                        java.util.Arrays.fill(mask, start, start + elementSize, (byte) 0xff);
+                        break;
+                    }
+                }
+            }
+        }
+        return mask;
+    }
+
+    private static void applyExternalBytes(ConfigurationImage image, ConfigurationImage after, byte[] mask) {
+        byte[] target = image.getContent();
+        if (target.length != mask.length) {
+            return;
+        }
+        byte[] source = after.getContent();
+        for (int i = 0; i < target.length; i++) {
+            target[i] = (byte) ((target[i] & ~mask[i]) | (source[i] & mask[i]));
         }
     }
 

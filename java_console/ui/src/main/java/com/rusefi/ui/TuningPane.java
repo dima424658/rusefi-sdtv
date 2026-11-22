@@ -11,6 +11,7 @@ import com.rusefi.core.SensorCentral;
 import com.rusefi.core.SensorSubscription;
 import com.rusefi.maintenance.OfflineEditMigration;
 import com.rusefi.io.ConnectionStatusLogic;
+import com.rusefi.io.LinkManager;
 import com.rusefi.core.preferences.storage.Node;
 import com.rusefi.ui.widgets.TextGaugeStrip;
 import com.rusefi.ui.widgets.SegmentedControl;
@@ -106,11 +107,16 @@ public class TuningPane {
 
         ConfigurationImage baseline = initialBaseline;
         BinaryProtocol initialBp = uiContext.getBinaryProtocol();
-        if (baseline == null && initialBp != null && initialBp.getControllerConfiguration() != null) {
-            baseline = initialBp.getControllerConfiguration().clone();
+        ConfigurationImage initialImage = initialBaseline;
+        if (baseline == null && initialBp != null) {
+            initialImage = initialBp.getControllerConfiguration();
+            baseline = initialBp.getCachedImage();
+            if (baseline == null) {
+                baseline = initialImage;
+            }
         }
-        if (baseline != null) {
-            left.refreshExpressions(baseline);
+        if (initialImage != null) {
+            left.refreshExpressions(initialImage);
         }
         StatusPanel loadStatusPanel = new StatusPanel(250);
         loadStatusCard = new TuneOperationStatusPanel(loadStatusPanel, this::showTuningContent);
@@ -327,10 +333,12 @@ public class TuningPane {
         content.add(tuningContent, TUNING_CARD);
         content.add(loadStatusCard.getContent(), LOAD_CARD);
         showTuningContent();
-        if (baseline != null) {
-            sessionImage.set(baseline.clone());
+        if (initialImage != null) {
+            sessionImage.set(initialImage.clone());
             right.update((String) null, uiContext.iniFileState.getIniFileModel(), sessionImage.get());
+            toolbar.refreshState();
         }
+        uiContext.setExternalTuneListener(this::applyExternalTune);
     }
 
     public void restoreDetachedPanels(Window owner) {
@@ -394,10 +402,18 @@ public class TuningPane {
             gaugeStrip.destroy();
         }
         workspace.destroy();
+        uiContext.setExternalTuneListener(null);
         uiContext.removeConfigImageListener(unburnedTreeListener);
         indicatorStrip.destroy();
         eventTriggerToken.remove();
         ConnectionStatusLogic.INSTANCE.removeListener(connectionStatusListener);
+    }
+
+    private void applyExternalTune(LinkManager.ExternalTuneChange change) {
+        ConfigurationImage image = toolbar.applyExternalTune(change);
+        right.update(currentKey.get(), uiContext.iniFileState.getIniFileModel(), image);
+        left.refreshExpressions(image);
+        uiContext.fireConfigImageChanged(image);
     }
 
     private void updateEventTriggerDemand() {

@@ -13,6 +13,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.BitSet;
 import java.util.Collections;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.*;
@@ -28,7 +29,7 @@ class EcuDataLoggerTest {
         EcuDataLogger logger = new EcuDataLogger();
         Path file = tempDir.resolve("samples.mlg");
         try {
-            logger.start(ini, file, null);
+            logger.start(ini, file, null, () -> true);
             long generation = sensors.getOutputChannelDemand().getGeneration();
             publish(ini, generation - 1, true);
             publish(ini, generation, false);
@@ -50,10 +51,10 @@ class EcuDataLoggerTest {
     void rejectsMissingDirectoryAndEmptyChannelsWithoutAcquiringLease() {
         EcuDataLogger logger = new EcuDataLogger();
         assertThrows(java.io.IOException.class,
-                () -> logger.start(ini(), tempDir.resolve("missing/file.mlg"), null));
+                () -> logger.start(ini(), tempDir.resolve("missing/file.mlg"), null, () -> true));
         IniFileModel empty = mock(IniFileModel.class);
         when(empty.getAllOutputChannels()).thenReturn(Collections.emptyMap());
-        assertThrows(IllegalArgumentException.class, () -> logger.start(empty, tempDir.resolve("empty.mlg"), null));
+        assertThrows(IllegalArgumentException.class, () -> logger.start(empty, tempDir.resolve("empty.mlg"), null, () -> true));
         assertFalse(Files.exists(tempDir.resolve("empty.mlg")));
         assertEquals(Boolean.FALSE, logger.status().get("logging"));
         assertFalse(SensorCentral.getInstance().getOutputChannelDemand().isFull());
@@ -65,11 +66,11 @@ class EcuDataLoggerTest {
         Path first = null;
         Path second = null;
         try {
-            first = Path.of((String) logger.start(ini(), null, null).get("path"));
+            first = Path.of((String) logger.start(ini(), null, null, () -> true).get("path"));
             assertTrue(first.isAbsolute());
             assertTrue(Files.size(first) > 24, "header is written before start succeeds");
             logger.stop();
-            second = Path.of((String) logger.start(ini(), null, null).get("path"));
+            second = Path.of((String) logger.start(ini(), null, null, () -> true).get("path"));
             assertNotEquals(first, second);
             assertEquals(0L, logger.status().get("sampleCount"));
         } finally {
@@ -95,7 +96,7 @@ class EcuDataLoggerTest {
         when(ini.getAllOutputChannels()).thenReturn(Collections.singletonMap("rpm", broken));
         EcuDataLogger logger = new EcuDataLogger();
         try {
-            logger.start(ini, tempDir.resolve("broken.mlg"), null);
+            logger.start(ini, tempDir.resolve("broken.mlg"), null, () -> true);
             // Decode through the healthy INI so only the recorder sees the broken field.
             publish(ini(), SensorCentral.getInstance().getOutputChannelDemand().getGeneration(), true);
             JSONObject status = logger.status();
@@ -105,7 +106,7 @@ class EcuDataLoggerTest {
             assertEquals(0L, status.get("sampleCount"));
             assertEquals(status, logger.stop());
             assertFalse(SensorCentral.getInstance().getOutputChannelDemand().isFull());
-            assertEquals(Boolean.TRUE, logger.start(ini(), tempDir.resolve("recovered.mlg"), null).get("success"));
+            assertEquals(Boolean.TRUE, logger.start(ini(), tempDir.resolve("recovered.mlg"), null, () -> true).get("success"));
         } finally {
             logger.stop();
         }
@@ -117,12 +118,30 @@ class EcuDataLoggerTest {
         Path log = tempDir.resolve("failed.mlg");
         // Empty tunes cannot be serialized by the shared MSQ writer.
         com.rusefi.tune.xml.Msq invalid = com.rusefi.tune.xml.Msq.create(128, "test");
-        assertThrows(IllegalStateException.class, () -> logger.start(ini(), log, invalid));
+        assertThrows(IllegalStateException.class, () -> logger.start(ini(), log, invalid, () -> true));
         assertEquals(Boolean.FALSE, logger.status().get("logging"));
         assertFalse(Files.exists(log));
         assertFalse(SensorCentral.getInstance().getOutputChannelDemand().isFull());
         try (java.util.stream.Stream<Path> files = Files.list(tempDir)) {
             assertEquals(0, files.count());
+        }
+    }
+
+    @Test
+    void stopsBeforeRecordingSamplesFromAReplacementConnection() throws Exception {
+        IniFileModel ini = ini();
+        EcuDataLogger logger = new EcuDataLogger();
+        AtomicBoolean current = new AtomicBoolean(true);
+        try {
+            logger.start(ini, tempDir.resolve("connection.mlg"), null, current::get);
+            long generation = SensorCentral.getInstance().getOutputChannelDemand().getGeneration();
+            publish(ini, generation, true);
+            current.set(false);
+            publish(ini, generation, true);
+            assertEquals(1L, logger.status().get("sampleCount"));
+            assertEquals(false, logger.status().get("logging"));
+        } finally {
+            logger.stop();
         }
     }
 

@@ -168,7 +168,8 @@ public enum CalibrationsUpdater {
         return result[0];
     }
 
-    static boolean uploadPages(
+    /** Upload and burn the requested pages. Call on the ECU communication executor. */
+    public static boolean uploadPages(
         final BinaryProtocol binaryProtocol,
         final CalibrationsInfo calibrations,
         final UpdateOperationCallbacks callbacks

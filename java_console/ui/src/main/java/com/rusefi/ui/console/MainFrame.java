@@ -27,6 +27,7 @@ import com.rusefi.core.FindFileHelper;
 import com.rusefi.core.RusEfiSignature;
 import com.rusefi.core.SignatureHelper;
 import com.rusefi.maintenance.VersionChecker;
+import com.rusefi.mcp.ConsoleMcpHttpServer;
 import com.rusefi.core.preferences.storage.Node;
 import com.rusefi.core.ui.FrameHelper;
 import com.rusefi.sensor_logs.LoggingProfiles;
@@ -282,6 +283,7 @@ public class MainFrame {
     private JMenuItem checkEcuUpdateItem;
     private JMenuItem updateEcuItem;
     private BinaryLoggingMenu binaryLoggingMenu;
+    private ConsoleMcpHttpServer consoleMcp;
     private JMenu toolsMenu;
     private ShortcutsDialog shortcutsDialog;
     private TitleBarPanel titleBarPanel;
@@ -1164,6 +1166,7 @@ public class MainFrame {
         });
 
         final LinkManager linkManager = consoleUI.uiContext.getLinkManager();
+        startConsoleMcp(linkManager);
         BinaryProtocol existingBp = linkManager.getBinaryProtocol();
         boolean alreadyConnected = existingBp != null && existingBp.getControllerConfiguration() != null;
         if (alreadyConnected) {
@@ -1366,7 +1369,27 @@ public class MainFrame {
         showConnectionFailureOverlay(errorMessage);
     }
 
+    private void startConsoleMcp(LinkManager linkManager) {
+        String port = System.getProperty("rusefi.console.mcp.port");
+        if (port == null || consoleMcp != null) {
+            return;
+        }
+        try {
+            int number = Integer.parseInt(port);
+            if (number < 1 || number > 65535) {
+                throw new IllegalArgumentException("MCP port must be between 1 and 65535.");
+            }
+            consoleMcp = new ConsoleMcpHttpServer(linkManager, number, System.getenv("RUSEFI_CONSOLE_MCP_TOKEN"));
+            log.info("Console MCP listening on http://127.0.0.1:" + consoleMcp.getPort() + "/mcp");
+        } catch (java.io.IOException | IllegalArgumentException e) {
+            log.warn("Could not start Console MCP: " + e.getMessage());
+        }
+    }
+
     private void windowClosedHandler() {
+        if (consoleMcp != null) {
+            consoleMcp.close();
+        }
         consoleUI.closeAssistant();
         configErrorSubscription.remove();
         configErrorHealTimer.stop();

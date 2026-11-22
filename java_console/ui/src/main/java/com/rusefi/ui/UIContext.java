@@ -13,6 +13,7 @@ import com.rusefi.ui.wizard.WizardStepDescriptor;
 import org.jetbrains.annotations.NotNull;
 
 import javax.swing.JComponent;
+import javax.swing.SwingUtilities;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.function.Supplier;
@@ -48,7 +49,7 @@ public class UIContext {
 
     /** Tests and offline tools: the LinkManager records the board identity into its own private instance. */
     public UIContext() {
-        this.linkManager = new LinkManager();
+        this(new LinkManager());
     }
 
     /**
@@ -56,7 +57,16 @@ public class UIContext {
      * target recorded at connect time is visible to offline flashing decisions.
      */
     public UIContext(com.rusefi.core.io.ConnectedEcuTarget connectedEcuTarget) {
-        this.linkManager = new LinkManager(connectedEcuTarget);
+        this(new LinkManager(connectedEcuTarget));
+    }
+
+    private UIContext(LinkManager linkManager) {
+        this.linkManager = linkManager;
+        linkManager.setExternalTuneListener(change -> SwingUtilities.invokeLater(() -> {
+            if (getBinaryProtocol() == change.protocol && !change.protocol.isClosed() && !isOfflineMode()) {
+                externalTuneListener.accept(change);
+            }
+        }));
     }
 
     public SensorLogger sensorLogger = new SensorLogger(this::getBinaryProtocol);
@@ -135,6 +145,11 @@ public class UIContext {
     private ConfigurationImage currentConfigurationImage;
     private IniFileModel configurationImageIni;
     private Function<Consumer<ConfigurationImage>, Boolean> tuneEditor = edit -> false;
+    private Consumer<LinkManager.ExternalTuneChange> externalTuneListener = change -> fireConfigImageChanged(change.after);
+
+    void setExternalTuneListener(Consumer<LinkManager.ExternalTuneChange> listener) {
+        externalTuneListener = listener == null ? change -> fireConfigImageChanged(change.after) : listener;
+    }
 
     /** Edits from auxiliary tabs share Tuning's working image, undo history and upload queue. */
     public void setTuneEditor(Function<Consumer<ConfigurationImage>, Boolean> tuneEditor) {

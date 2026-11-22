@@ -1,7 +1,9 @@
 package com.rusefi.mcp;
 
 import com.devexperts.logging.Logging;
+import com.opensr5.ConfigurationImage;
 import com.opensr5.ini.IniFileModel;
+import com.opensr5.ini.field.StringIniField;
 import com.rusefi.binaryprotocol.BinaryProtocol;
 import com.rusefi.binaryprotocol.IniNotFoundException;
 import com.rusefi.config.generated.Integration;
@@ -39,7 +41,6 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.FutureTask;
-import java.util.concurrent.TimeUnit;
 import java.util.regex.Pattern;
 
 import static com.devexperts.logging.Logging.getLogging;
@@ -92,6 +93,7 @@ public class EcuMcpServer {
 
     /** Lazy-initialized link manager — created on first ECU-touching tool call. */
     private volatile LinkManager linkManager;
+    private boolean consoleOwnedConnection;
     private BinaryProtocol borrowedProtocol;
     private MessagesCentral.MessageListener messagesListener;
     private volatile boolean closed;
@@ -173,12 +175,18 @@ public class EcuMcpServer {
         log.info("stdin closed, exiting");
     }
 
-    /** Embedded mode borrows an already connected Console; it never discovers or owns a port. */
+    /** Embedded mode borrows a Console connection and never discovers or owns a port. */
     EcuMcpServer(LinkManager linkManager, BinaryProtocol protocol) {
         this(null, null, null);
         this.linkManager = linkManager;
+        this.consoleOwnedConnection = true;
         this.borrowedProtocol = protocol;
         installMessagesListener();
+    }
+
+    /** Follow the Console's current connection instead of binding to one protocol instance. */
+    EcuMcpServer(LinkManager linkManager) {
+        this(linkManager, null);
     }
 
     void shutdown() {
@@ -188,7 +196,7 @@ public class EcuMcpServer {
         }
         dataLogger.stop();
         LinkManager lm = linkManager;
-        if (lm != null && borrowedProtocol == null) {
+        if (lm != null && !consoleOwnedConnection) {
             try { lm.close(); } catch (Throwable ignored) {}
         }
         synchronized (connectLock) {
@@ -205,9 +213,15 @@ public class EcuMcpServer {
 
     private void installMessagesListener() {
         messagesListener = (clazz, message) -> {
-            if (closed || (borrowedProtocol != null
-                    && (linkManager.getBinaryProtocol() != borrowedProtocol || borrowedProtocol.isClosed()))) {
+            if (closed) {
                 return;
+            }
+            if (consoleOwnedConnection) {
+                BinaryProtocol current = linkManager.getBinaryProtocol();
+                if (current == null || current.isClosed()
+                        || (borrowedProtocol != null && current != borrowedProtocol)) {
+                    return;
+                }
             }
             synchronized (messageLock) {
                 long seq = ++messageSeq;
@@ -302,7 +316,7 @@ public class EcuMcpServer {
     // -----------------------------------------------------------------------------------
 
     @SuppressWarnings("unchecked")
-    JSONObject toolsList() {
+    static JSONObject toolsList() {
         JSONArray tools = new JSONArray();
         tools.add(tool("connect",
                 "Connect to the ECU (autodetect serial port unless --port was passed on startup). " +
@@ -632,6 +646,21 @@ public class EcuMcpServer {
             return linkManager;
         }
         LinkManager lm = linkManager;
+        if (consoleOwnedConnection) {
+            synchronized (connectLock) {
+                BinaryProtocol current = lm.getBinaryProtocol();
+                if (closed || current == null || current.isClosed() || !lm.isActive()) {
+                    throw new IOException("Connect to an ECU in rusEFI Console first.");
+                }
+                if (portOrNull != null && !portOrNull.equals(lm.getLastTriedPort())) {
+                    throw new IOException("Select the ECU port in rusEFI Console.");
+                }
+                if (fullOutputLease == null) {
+                    fullOutputLease = SensorCentral.getInstance().acquireFullOutput();
+                }
+                return lm;
+            }
+        }
         if (lm != null && lm.isActive()) return lm;
         synchronized (connectLock) {
             if (linkManager != null && linkManager.isActive()) return linkManager;
@@ -700,7 +729,19 @@ public class EcuMcpServer {
         }
 
         LinkManager lm = ensureConnected(null);
+        BinaryProtocol protocol = lm.getBinaryProtocol();
+        boolean notifyConsole = lm.tracksExternalTuneChanges();
+        ConfigurationImage before = notifyConsole ? protocol.getControllerConfiguration() : null;
         LuaService.LuaApplyResult r = LuaService.applyLuaScript(lm, script, timeout);
+        if (notifyConsole && r.success) {
+            lm.submit(() -> {
+                StringIniField field = LuaService.getLuaScriptField(protocol);
+                if (field != null && field.getPageIndex() == 0) {
+                    lm.publishExternalTuneChange(protocol, before, protocol.getControllerConfiguration(), r.burnSucceeded);
+                }
+                lm.publishExternalLuaChange(protocol);
+            });
+        }
         JSONObject o = new JSONObject();
         o.put("success", r.success);
         if (!r.success) o.put("error", r.error);
@@ -739,11 +780,34 @@ public class EcuMcpServer {
             return errorBody("'command' is required");
         }
         LinkManager lm = ensureConnected(null);
-        LuaService.sendCommand(lm, cmd);
+        if (lm.tracksExternalTuneChanges()) {
+            BinaryProtocol protocol = lm.getBinaryProtocol();
+            lm.getCommandQueue().write(cmd, () -> lm.submit(() -> refreshAfterCommand(lm, protocol, cmd)));
+        } else {
+            LuaService.sendCommand(lm, cmd);
+        }
         JSONObject o = new JSONObject();
         o.put("queued", true);
         o.put("command", cmd);
         return o;
+    }
+
+    private void refreshAfterCommand(LinkManager link, BinaryProtocol protocol, String command) {
+        if (closed || link.getBinaryProtocol() != protocol || protocol.isClosed()) {
+            return;
+        }
+        ConfigurationImage before = protocol.getControllerConfiguration();
+        if (before == null) {
+            return;
+        }
+        byte[] data = protocol.readFromPage(0, 0, before.getSize());
+        if (data != null) {
+            String normalized = command.trim().toLowerCase(Locale.ROOT);
+            boolean burned = Integration.CMD_BURNCONFIG.equals(normalized)
+                    || Integration.CMD_WRITECONFIG.equals(normalized);
+            link.publishExternalTuneChange(protocol, before, new ConfigurationImage(data, before.getByteOrder()), burned);
+        }
+        link.publishExternalLuaChange(protocol);
     }
 
     private JSONObject doStartDataLogging(JSONObject args) throws Exception {
@@ -763,7 +827,8 @@ public class EcuMcpServer {
             return errorBody("No .ini model for this connection");
         }
         Msq tune = (Boolean) saveTune ? TuneSnapshot.read(lm, bp, ini) : null;
-        return dataLogger.start(ini, requestedPath == null ? null : Paths.get((String) requestedPath), tune);
+        return dataLogger.start(ini, requestedPath == null ? null : Paths.get((String) requestedPath), tune,
+                () -> lm.getBinaryProtocol() == bp && !bp.isClosed());
     }
 
     @SuppressWarnings("unchecked")
@@ -801,7 +866,15 @@ public class EcuMcpServer {
             if (closed || lm.getBinaryProtocol() != bp || bp.isClosed()) {
                 throw new IllegalStateException("ECU connection changed before map access");
             }
-            return maps.access(bp, ini, args, operation);
+            boolean write = lm.tracksExternalTuneChanges() && ("write_map".equals(operation)
+                    || ("rollback_map_write".equals(operation) && Boolean.TRUE.equals(args.get("apply"))));
+            ConfigurationImage before = write ? bp.getControllerConfiguration() : null;
+            JSONObject result = maps.access(bp, ini, args, operation);
+            if (write && Boolean.TRUE.equals(result.get("success")) && Integer.valueOf(0).equals(result.get("page"))) {
+                lm.publishExternalTuneChange(bp, before, bp.getControllerConfiguration(),
+                        Boolean.TRUE.equals(result.get("burnAcknowledged")));
+            }
+            return result;
         });
         lm.submit(task);
         try {
@@ -880,8 +953,28 @@ public class EcuMcpServer {
             }
         }
 
+        IniFileModel resolvedSourceIni = sourceIni;
+        FutureTask<JSONObject> write = new FutureTask<>(() -> {
+            if (closed || lm.getBinaryProtocol() != bp || bp.isClosed()) {
+                throw new IllegalStateException("ECU connection changed before tune write");
+            }
+            return writeTune(lm, bp, input, sourceTune, sourceSignature, resolvedSourceIni);
+        });
+        lm.submit(write);
+        try {
+            return write.get();
+        } finally {
+            write.cancel(false);
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private JSONObject writeTune(LinkManager lm, BinaryProtocol bp, Path input, Msq sourceTune,
+                                 String sourceSignature, IniFileModel sourceIni) {
+        boolean notifyConsole = lm.tracksExternalTuneChanges();
+        ConfigurationImage before = notifyConsole ? bp.getControllerConfiguration() : null;
         TuneWriteCallbacks callbacks = new TuneWriteCallbacks();
-        Optional<CalibrationsInfo> current = readCalibrations(lm, bp, callbacks);
+        Optional<CalibrationsInfo> current = CalibrationsHelper.readCurrentCalibrations(bp, callbacks);
         if (!current.isPresent()) {
             return tuneWriteFailure("Failed to read the current ECU tune", input, sourceTune,
                     sourceSignature, bp, callbacks, Collections.emptyList(), false);
@@ -893,17 +986,25 @@ public class EcuMcpServer {
         boolean changed = merge.mergedCalibrations.isPresent();
         CalibrationsInfo expected = merge.mergedCalibrations.orElse(current.get());
 
-        if (changed && !CalibrationsUpdater.INSTANCE.updateCalibrations(
-                bp, lm, expected, callbacks)) {
+        if (changed && !CalibrationsUpdater.uploadPages(bp, expected, callbacks)) {
             return tuneWriteFailure("Failed to write or burn the merged tune", input, sourceTune,
                     sourceSignature, bp, callbacks, merge.failedFields, true);
         }
 
-        Optional<CalibrationsInfo> reread = readCalibrations(lm, bp, callbacks);
+        Optional<CalibrationsInfo> reread = CalibrationsHelper.readCurrentCalibrations(bp, callbacks);
         boolean verified = reread.isPresent() && sameCalibrationPages(expected, reread.get());
         if (!verified) {
             return tuneWriteFailure("ECU tune readback did not match the requested result", input, sourceTune,
                     sourceSignature, bp, callbacks, merge.failedFields, changed);
+        }
+        if (notifyConsole) {
+            CalibrationsInfo actual = reread.get();
+            lm.publishExternalTuneChange(bp, before,
+                    actual.getPage(0).getConfigurationImage(), expected.getPagesToWrite().contains(0));
+            StringIniField lua = LuaService.getLuaScriptField(bp);
+            if (lua != null && expected.getPagesToWrite().contains(lua.getPageIndex())) {
+                lm.publishExternalLuaChange(bp);
+            }
         }
 
         JSONObject result = tuneWriteBase(input, sourceTune, sourceSignature, bp, callbacks, merge.failedFields);
@@ -911,19 +1012,6 @@ public class EcuMcpServer {
         result.put("changed", changed);
         result.put("verified", true);
         return result;
-    }
-
-    private static Optional<CalibrationsInfo> readCalibrations(
-            LinkManager lm, BinaryProtocol bp, UpdateOperationCallbacks callbacks) throws Exception {
-        FutureTask<Optional<CalibrationsInfo>> read = new FutureTask<>(
-                () -> CalibrationsHelper.readCurrentCalibrations(bp, callbacks));
-        lm.submit(read);
-        try {
-            return read.get(60, TimeUnit.SECONDS);
-        } finally {
-            // Do not interrupt an in-flight wire transaction if the caller is cancelled/times out.
-            read.cancel(false);
-        }
     }
 
     private static boolean sameCalibrationPages(CalibrationsInfo expected, CalibrationsInfo actual) {
@@ -1155,7 +1243,7 @@ public class EcuMcpServer {
     }
 
     @SuppressWarnings("unchecked")
-    private static JSONObject wrapToolResult(JSONObject body) {
+    static JSONObject wrapToolResult(JSONObject body) {
         // MCP tools/call result envelope: { content: [ { type: "text", text: "..." } ], isError: bool }
         JSONObject envelope = new JSONObject();
         JSONArray content = new JSONArray();
@@ -1171,7 +1259,7 @@ public class EcuMcpServer {
     }
 
     @SuppressWarnings("unchecked")
-    private static JSONObject toolError(String message) {
+    static JSONObject toolError(String message) {
         JSONObject body = new JSONObject();
         body.put("success", false);
         body.put("error", message);

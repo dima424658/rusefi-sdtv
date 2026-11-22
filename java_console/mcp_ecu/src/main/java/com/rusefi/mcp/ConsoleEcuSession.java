@@ -10,6 +10,7 @@ import java.io.IOException;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
@@ -34,7 +35,9 @@ public final class ConsoleEcuSession implements AutoCloseable {
     private final EcuMcpServer server;
     private final SensorCentral.FullOutputLease lease;
     private final SensorCentral.SnapshotListenerToken samples;
-    private final Map<String, JSONObject> definitions = new HashMap<>();
+    private static final List<String> DIRECT_READ_NAMES = Arrays.asList("list_output_channels",
+            "read_live_values", "diagnostic_snapshot", "read_tune_fields", "capture_live_log");
+    private static final Map<String, JSONObject> DEFINITIONS = createDefinitions();
     private final LongSupplier nanoTime;
     private final AtomicLong sampleSequence = new AtomicLong();
     private volatile Sample sample;
@@ -59,7 +62,11 @@ public final class ConsoleEcuSession implements AutoCloseable {
                         currentTimeMillis.getAsLong(), nanoTime.getAsLong());
             }
         });
-        for (Object item : (JSONArray) server.toolsList().get("tools")) {
+    }
+
+    private static Map<String, JSONObject> createDefinitions() {
+        Map<String, JSONObject> definitions = new HashMap<>();
+        for (Object item : (JSONArray) EcuMcpServer.toolsList().get("tools")) {
             JSONObject definition = (JSONObject) item;
             String name = (String) definition.get("name");
             if (Arrays.asList("ecu_info", "read_output_channel", "read_messages").contains(name)) {
@@ -101,6 +108,7 @@ public final class ConsoleEcuSession implements AutoCloseable {
                 "description", "Observe the next Console engine-sniffer chart alongside the UI using current firmware settings. Return at most 128 events and 32 channel summaries, without raw chart text. Does not enable, reset or configure the sniffer. Times are chart-relative; receivedAt is host time.",
                 "inputSchema", object("type", "object", "properties", object("timeoutMs", integerSchema(1, 10000),
                         "max_events", integerSchema(1, 128)), "additionalProperties", false)));
+        return definitions;
     }
 
     private static JSONObject integerSchema(int min, int max) { return object("type", "integer", "minimum", min, "maximum", max); }
@@ -121,17 +129,27 @@ public final class ConsoleEcuSession implements AutoCloseable {
         for (String name : Arrays.asList("ecu_info", "list_output_channels", "read_output_channel",
                 "read_live_values", "diagnostic_snapshot", "read_tune_fields", "get_lua", "capture_live_log",
                 "capture_engine_sniffer", "read_messages")) {
-            JSONObject tool = definitions.get(name);
+            JSONObject tool = DEFINITIONS.get(name);
             result.add(object("type", "function", "name", name, "description", tool.get("description"),
                     "parameters", tool.get("inputSchema"), "strict", false));
         }
         return result;
     }
 
+    static boolean isAdditionalTool(String name) {
+        return DIRECT_READ_NAMES.contains(name);
+    }
+
+    static void appendAdditionalTools(JSONArray tools) {
+        for (String name : DIRECT_READ_NAMES) {
+            tools.add(DEFINITIONS.get(name));
+        }
+    }
+
     public JSONObject execute(String name, JSONObject args, Runnable checkCancellation) throws Exception {
         checkCancellation.run();
         checkConnected();
-        JSONObject definition = definitions.get(name);
+        JSONObject definition = DEFINITIONS.get(name);
         if (definition == null) {
             return error("Tool is not available in the Console read-only session.");
         }

@@ -12,6 +12,36 @@ updates firmware via OpenBLT while backing up and migrating the ECU configuratio
 `download_bundle` fetches fresh board or universal autoupdate bundles and returns
 the extracted firmware paths.
 
+## Connect an MCP client to the running Console
+
+Start the Console with a local MCP port from the repo root.
+
+```bash
+java -Drusefi.console.mcp.port=29003 -jar console/rusefi_console.jar &
+codex mcp add rusefi-console --url http://127.0.0.1:29003/mcp
+codex
+```
+
+Select and connect to your ECU or simulator in the Console. The endpoint provides
+the full standalone tool catalog over Streamable HTTP, including tune and map
+writes, Lua uploads, host file operations, and firmware updates. It also
+exposes direct calibration-field reads and the Console's batch telemetry tools.
+ECU tools use the Console's current connection. The `connect` tool reports that connection,
+and port selection stays in the Console. The endpoint closes with the Console.
+
+Tune writes, map edits and rollbacks refresh the open Tuning panels and views
+that use the working tune. Pending Console edits to other settings remain
+available. Lua uploads refresh an open Lua editor when it has no local edits.
+
+The port is opt-in and listens on IPv4 loopback. By default, local processes can
+use the endpoint without authentication, including tools that change the tune,
+flash the ECU, or access host files. Browser requests with an `Origin` header
+are rejected. To require authentication, export `RUSEFI_CONSOLE_MCP_TOKEN` with
+a random token of at least 32 characters before starting the Console and add
+`--bearer-token-env-var RUSEFI_CONSOLE_MCP_TOKEN` when registering it with Codex.
+For long-running tools such as `update_firmware`, set an appropriate
+`tool_timeout_sec` in the Codex MCP server configuration.
+
 ## Embedded Console use
 
 The Console's **Troubleshooting** tab uses `ConsoleEcuSession` in process. This

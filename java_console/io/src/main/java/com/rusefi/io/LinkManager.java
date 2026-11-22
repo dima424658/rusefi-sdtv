@@ -2,6 +2,7 @@ package com.rusefi.io;
 
 import com.devexperts.logging.Logging;
 import com.fazecast.jSerialComm.SerialPort;
+import com.opensr5.ConfigurationImage;
 import com.rusefi.Callable;
 import com.rusefi.binaryprotocol.BinaryProtocol;
 import com.rusefi.binaryprotocol.BinaryProtocolState;
@@ -25,6 +26,7 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.TreeSet;
 import java.util.concurrent.*;
+import java.util.function.Consumer;
 import java.util.stream.Collectors;
 
 import static com.devexperts.logging.Logging.getLogging;
@@ -43,6 +45,69 @@ public class LinkManager implements Closeable {
     // Synthetic marker for a board in the STM32 built-in bootloader (DFU). Not a real serial port —
     // never opened as a stream; used only to surface DFU in the ports list [tag:better_ux_for_flashing].
     public static final String DFU = "DFU";
+
+    public static final class ExternalTuneChange {
+        public final BinaryProtocol protocol;
+        public final ConfigurationImage before;
+        public final ConfigurationImage after;
+        public final boolean burned;
+        public final long revision;
+
+        private ExternalTuneChange(BinaryProtocol protocol, ConfigurationImage before,
+                                   ConfigurationImage after, boolean burned, long revision) {
+            this.protocol = protocol;
+            this.before = before;
+            this.after = after;
+            this.burned = burned;
+            this.revision = revision;
+        }
+    }
+
+    private volatile long externalTuneRevision;
+    private volatile Consumer<ExternalTuneChange> externalTuneListener;
+    private volatile Consumer<BinaryProtocol> externalLuaListener = protocol -> { };
+
+    public void setExternalTuneListener(Consumer<ExternalTuneChange> listener) {
+        externalTuneListener = listener;
+    }
+
+    public void setExternalLuaListener(Consumer<BinaryProtocol> listener) {
+        externalLuaListener = listener;
+    }
+
+    public boolean tracksExternalTuneChanges() {
+        return externalTuneListener != null;
+    }
+
+    public long getExternalTuneRevision() {
+        return externalTuneRevision;
+    }
+
+    /** Called on the communication executor after a change made outside the UI. */
+    public void publishExternalTuneChange(BinaryProtocol protocol, ConfigurationImage before,
+                                          ConfigurationImage after, boolean burned) {
+        if (before == null || after == null || before.getSize() != after.getSize()
+                || getBinaryProtocol() != protocol || protocol.isClosed()) {
+            return;
+        }
+        if (!burned && Arrays.equals(before.getContent(), after.getContent())) {
+            return;
+        }
+        protocol.setConfigurationImage(after);
+        if (burned) {
+            protocol.cacheCurrentImage();
+        }
+        Consumer<ExternalTuneChange> listener = externalTuneListener;
+        if (listener != null) {
+            listener.accept(new ExternalTuneChange(protocol, before, after, burned, ++externalTuneRevision));
+        }
+    }
+
+    public void publishExternalLuaChange(BinaryProtocol protocol) {
+        if (getBinaryProtocol() == protocol && !protocol.isClosed()) {
+            externalLuaListener.accept(protocol);
+        }
+    }
 
     @FunctionalInterface
     public interface EcuCompatibilityListener {
@@ -522,9 +587,9 @@ public class LinkManager implements Closeable {
         log.info("restart: closing current connection");
         close(); // Explicitly kill the connection (call connectors destructor??????)
 
-        // SocketCAN is a named transport rather than an OS serial port. Avoid serial enumeration and
-        // let its stream factory decide whether the configured CAN interface is available again.
-        final Set<String> ports = isSocketCan(lastTriedPort) ? Collections.emptySet() : getCommPorts();
+        // CAN and TCP have their own stream factories and do not depend on serial enumeration.
+        final Set<String> ports = canReconnectWithoutSerialEnumeration(lastTriedPort)
+            ? Collections.emptySet() : getCommPorts();
         final boolean isPortAvailableAgain = isPortAvailableForReconnect(lastTriedPort, ports);
         log.info("restart isPortAvailableAgain=" + isPortAvailableAgain + " port=" + lastTriedPort);
         if (isPortAvailableAgain) {
@@ -538,7 +603,11 @@ public class LinkManager implements Closeable {
     }
 
     static boolean isPortAvailableForReconnect(String port, Set<String> serialPorts) {
-        return isCanPort(port) || serialPorts.contains(port);
+        return canReconnectWithoutSerialEnumeration(port) || serialPorts.contains(port);
+    }
+
+    private static boolean canReconnectWithoutSerialEnumeration(String port) {
+        return isCanPort(port) || (port != null && TcpConnector.isTcpPort(port));
     }
 
     @Override

@@ -186,6 +186,7 @@ final class EcuMaps {
                 writes.remove(id);
             }
             return object("success", true, "writeId", id, "id", write.table.getTableId(),
+                    "page", field.getPageIndex(),
                     "applied", apply, "complete", conflicts.isEmpty(), "burnAcknowledged", burn,
                     apply ? "restoredCells" : "eligibleCells", eligible,
                     "conflicts", conflicts, "alreadyRestored", unchanged);
@@ -227,7 +228,7 @@ final class EcuMaps {
 
     private static JSONObject describe(TableModel table, ArrayIniField field) {
         return object("id", table.getTableId(), "title", table.getTitle(),
-                "field", field.getName(), "rows", field.getRows(), "columns", field.getCols(),
+                "field", field.getName(), "page", field.getPageIndex(), "rows", field.getRows(), "columns", field.getCols(),
                 "units", field.getUnits(), "scale", field.getMultiplier(),
                 "min", field.getMin(), "max", field.getMax(),
                 "xField", table.getXBinsConstant(), "yField", table.getYBinsConstant());

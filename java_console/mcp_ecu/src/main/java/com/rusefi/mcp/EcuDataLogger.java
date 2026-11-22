@@ -17,9 +17,11 @@ import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.time.LocalDate;
 import java.util.List;
+import java.util.function.BooleanSupplier;
 
 /** One host-side recording, fed by complete ECU polls using the frontend's MLG encoder. */
 final class EcuDataLogger {
+    private BooleanSupplier connectionCurrent;
     private OutputStream output;
     private BinarySensorLog<CustomBinaryLogEntry> writer;
     private SensorCentral.SnapshotListenerToken listener;
@@ -31,7 +33,8 @@ final class EcuDataLogger {
     private int channelCount;
     private String error;
 
-    synchronized JSONObject start(IniFileModel ini, Path requestedPath, Msq tune) throws IOException {
+    synchronized JSONObject start(IniFileModel ini, Path requestedPath, Msq tune,
+                                  BooleanSupplier connected) throws IOException {
         if (writer != null) {
             throw new IllegalStateException("Data logging is already active; stop it before starting another file");
         }
@@ -62,6 +65,7 @@ final class EcuDataLogger {
             }
             throw failure;
         }
+        connectionCurrent = connected;
         writer = newWriter;
         tunePath = savedTune;
         output = opened;
@@ -77,6 +81,10 @@ final class EcuDataLogger {
 
     private synchronized void record(OutputChannelSnapshot snapshot) {
         if (writer == null || !snapshot.isFull() || snapshot.getGeneration() < lease.getGeneration()) {
+            return;
+        }
+        if (!connectionCurrent.getAsBoolean()) {
+            stop();
             return;
         }
         try {
@@ -95,6 +103,7 @@ final class EcuDataLogger {
             listener = null;
         }
         writer = null;
+        connectionCurrent = null;
         response = null;
         if (output != null) {
             try {

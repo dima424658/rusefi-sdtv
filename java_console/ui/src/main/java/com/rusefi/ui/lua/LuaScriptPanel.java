@@ -144,6 +144,15 @@ public class LuaScriptPanel {
                 }
             });
         });
+        context.getLinkManager().setExternalLuaListener(protocol -> {
+            if (context.getBinaryProtocol() == protocol) {
+                try {
+                    readFromECU();
+                } catch (RuntimeException e) {
+                    log.error("Failed to refresh Lua after an external edit", e);
+                }
+            }
+        });
 
         JSplitPane centerPanel = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT, scriptPanel, messagesPanel);
         centerPanel.setResizeWeight(0.5);

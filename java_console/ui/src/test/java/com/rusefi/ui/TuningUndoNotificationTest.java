@@ -7,6 +7,7 @@ import com.opensr5.ini.IniFileMetaInfoImpl;
 import com.opensr5.ini.IniFileModel;
 import com.opensr5.ini.RawIniFile;
 import com.rusefi.ini.reader.IniFileReaderUtil;
+import com.rusefi.binaryprotocol.BinaryProtocol;
 import org.junit.jupiter.api.Test;
 
 import javax.swing.JButton;
@@ -21,6 +22,7 @@ import java.util.List;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.*;
+import static org.mockito.Mockito.*;
 
 /**
  * Undo, Redo and Discard replace Tuning's tune; views following the working tune through
@@ -30,6 +32,56 @@ import static org.junit.jupiter.api.Assertions.*;
 class TuningUndoNotificationTest {
     private static final String B6 = "B6 Low Side output";
     private static final String B7 = "B7 Low Side output";
+
+    @Test
+    void externalTuneWriteUpdatesTheOpenPage() throws Throwable {
+        IniFileModel ini = readIni();
+        UIContext context = new UIContext();
+        AtomicReference<TuningPane> tuningRef = new AtomicReference<>();
+        AtomicReference<ConfigurationImage> notification = new AtomicReference<>();
+        ConfigurationImage initial = ConfigurationImageTestHelper.newLittleEndian(new byte[]{2, 0});
+        ConfigurationImage updated = ConfigurationImageTestHelper.newLittleEndian(new byte[]{1, 0});
+        BinaryProtocol protocol = mock(BinaryProtocol.class);
+        when(protocol.getControllerConfiguration()).thenReturn(initial);
+        context.getLinkManager().setBinaryProtocolForTests(protocol);
+        try {
+            SwingUtilities.invokeAndWait(() -> {
+                context.setIniFileModelForOffline(ini);
+                TuningPane tuning = new TuningPane(context);
+                tuningRef.set(tuning);
+                tuning.seedOfflineImage(initial, "fanSettings");
+                tuning.applyEdit(image -> {
+                    image.getContent()[0] |= 4;
+                    image.getContent()[1] = 3;
+                });
+                context.addConfigImageListener(notification::set);
+            });
+            context.getLinkManager().publishExternalTuneChange(protocol, initial, updated, true);
+            SwingUtilities.invokeAndWait(() -> {
+                TuningPane tuning = tuningRef.get();
+                assertEquals(B6, fan(ini, workingTune(tuning)));
+                assertEquals(5, workingTune(tuning).getContent()[0]);
+                assertEquals(3, workingTune(tuning).getContent()[1]);
+                assertEquals(B6, fan(ini, notification.get()));
+
+                button(tuning, "Undo").doClick();
+                assertEquals(B6, fan(ini, workingTune(tuning)));
+                assertEquals(1, workingTune(tuning).getContent()[0]);
+                assertEquals(0, workingTune(tuning).getContent()[1]);
+                button(tuning, "Redo").doClick();
+                button(tuning, "Discard changes").doClick();
+                assertEquals(B6, fan(ini, workingTune(tuning)));
+                assertEquals(0, workingTune(tuning).getContent()[1]);
+            });
+        } finally {
+            SwingUtilities.invokeAndWait(() -> {
+                if (tuningRef.get() != null) {
+                    tuningRef.get().destroy();
+                }
+                context.getLinkManager().close();
+            });
+        }
+    }
 
     @Test
     void undoRedoAndDiscardNotifyConfigImageListeners() throws Throwable {

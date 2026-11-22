@@ -1,5 +1,8 @@
 # Console troubleshooting assistant
 
+For connecting an external MCP client to the Console, see
+[Console MCP setup](../java_console/mcp_ecu/README.md#connect-an-mcp-client-to-the-running-console).
+
 The tab is available in online Console sessions for acceptance testing. It is
 hidden in offline and log-viewer modes. The integration and tools are packaged
 in the Console JAR.
