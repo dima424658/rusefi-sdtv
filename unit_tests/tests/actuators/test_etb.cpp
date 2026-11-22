@@ -465,11 +465,32 @@ TEST(etb, setpointNoPedalMap) {
 	EXPECT_EQ(etb.getSetpoint(), unexpected);
 }
 
+TEST(sdtv, defaultMapFollowsDemandAtEveryRpm) {
+	EngineTestHelper eth(engine_type_e::TEST_ENGINE);
+
+	EXPECT_EQ(0, config->sdtvDemandBins[0]);
+	EXPECT_EQ(100, config->sdtvDemandBins[PEDAL_TO_TPS_SIZE - 1]);
+	EXPECT_EQ(0, config->sdtvMinPosition);
+	EXPECT_EQ(100, config->sdtvMaxPosition);
+	EXPECT_EQ(0, config->sdtvIdleMinPosition);
+	EXPECT_EQ(15, config->sdtvIdleMaxPosition);
+	EXPECT_EQ(1, config->sdtvUsePps);
+	EXPECT_EQ(1, config->sdtvIdleControl);
+
+	for (size_t row = 0; row < efi::size(config->sdtvDemandBins); row++) {
+		for (auto opening : config->sdtvTable[row]) {
+			EXPECT_EQ(config->sdtvDemandBins[row], opening);
+		}
+	}
+}
+
 TEST(sdtv, selectsDemandAndHandsOffFromIdleToLiveMap) {
 	EngineTestHelper eth(engine_type_e::TEST_ENGINE);
 	EtbController actuator;
 	ASSERT_TRUE(actuator.init(DC_Sdtv, nullptr, &engineConfiguration->sdtvPid, nullptr));
 
+	config->sdtvUsePps = 0;
+	config->sdtvIdleControl = 0;
 	config->sdtvMinPosition = 2;
 	config->sdtvMaxPosition = 80;
 	for (size_t row = 0; row < efi::size(config->sdtvDemandBins); row++) {
@@ -519,7 +540,7 @@ TEST(sdtv, crankingUsesCoolantCurveAndStandstillDisablesDrive) {
 		config->cltCrankingCorrBins[i] = static_cast<float>(i) * 10;
 		config->cltCrankingCorr[i] = 100 - static_cast<float>(i) * 10;
 	}
-	Sensor::setMockValue(SensorType::Tps1, 0);
+	Sensor::setMockValue(SensorType::AcceleratorPedal, 0);
 	engine->rpmCalculator.setRpmValue(100);
 	ASSERT_TRUE(engine->rpmCalculator.isCranking());
 	Sensor::setMockValue(SensorType::Clt, 0);

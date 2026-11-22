@@ -13,12 +13,17 @@ at both stops. Calibrate the position PID manually or use **Start SDTV PID
 autotune**, then review the gains. Autotune needs the valve to start within
 the configured travel limits.
 
-The **Suzuki SDTV Opening** map uses RPM and either mechanical TPS1 (default)
-or PPS. Tune the opening cells live in TunerStudio or via the ECU MCP map
+The **Suzuki SDTV Opening** map uses RPM and either PPS (default)
+or mechanical TPS1. Tune the opening cells live in TunerStudio or via the ECU MCP map
 tools. Configure axes, travel limits, and sensor and motor settings with the
-engine stopped. The ECU uses calibrated percent open throughout.
+engine stopped. The ECU uses calibrated percent open throughout. In a fresh
+tune, the opening map follows demand from 0% to 100% at every RPM bin. The
+overall travel defaults to 0–100%, and idle travel starts at 0–15%. PPS and
+SDTV idle control are enabled in the starting settings. These settings take
+effect when SDTV is selected as the actuator. TunerStudio uses the same
+values for uninitialized fields in an offline project.
 
-Enable **Use SDTV for idle and cranking** only with the other idle actuators
+With **Use SDTV for idle and cranking** enabled, leave other idle actuators
 unassigned and modeled-flow idle disabled. Set the idle travel range, then
 tune the existing coolant-based cranking position and idle RPM settings. The
 idle output spans the configured idle travel range. The driving map resumes

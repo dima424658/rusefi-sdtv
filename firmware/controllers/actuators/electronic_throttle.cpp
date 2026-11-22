@@ -1067,13 +1067,19 @@ void setDefaultEtbParameters() {
 	setRpmTableBin(config->pedalToTpsRpmBins);
 	setLinearCurve(config->sdtvDemandBins, 0, 100, 1);
 	setRpmTableBin(config->sdtvRpmBins);
-	config->sdtvMaxPosition = 100;
+	config->sdtvMinPosition = SDTV_DEFAULT_MIN_POSITION;
+	config->sdtvMaxPosition = SDTV_DEFAULT_MAX_POSITION;
+	config->sdtvUsePps = SDTV_DEFAULT_USE_PPS;
+	config->sdtvIdleControl = SDTV_DEFAULT_IDLE_CONTROL;
+	config->sdtvIdleMinPosition = SDTV_DEFAULT_IDLE_MIN;
+	config->sdtvIdleMaxPosition = SDTV_DEFAULT_IDLE_MAX;
 	engineConfiguration->sdtvPid.minValue = -30;
 	engineConfiguration->sdtvPid.maxValue = 30;
 
 	for (int pedalIndex = 0;pedalIndex<PEDAL_TO_TPS_SIZE;pedalIndex++) {
 		for (int rpmIndex = 0;rpmIndex<PEDAL_TO_TPS_RPM_SIZE;rpmIndex++) {
 			config->pedalToTpsTable[pedalIndex][rpmIndex] = config->pedalToTpsPedalBins[pedalIndex];
+			config->sdtvTable[pedalIndex][rpmIndex] = config->sdtvDemandBins[pedalIndex];
 		}
 	}
 
